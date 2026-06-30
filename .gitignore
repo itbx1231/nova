@@ -1,0 +1,29 @@
+# Dependencies - never commit these
+node_modules/
+
+# Environment files - sensitive credentials
+.env
+.scan_creds
+
+# Build artifacts
+dist/
+frontend/dist/
+edge-agent/dist/
+
+# Logs
+*.log
+*.log.bak
+
+# Backup files
+*.bak
+*.backup
+*.broken
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# OS files
+.DS_Store
+Thumbs.db

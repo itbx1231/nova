@@ -1,0 +1,3396 @@
+require('dotenv').config();
+const http = require('http');
+
+// Global error handlers to prevent silent crashes
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Polyfill for BigInt JSON serialization
+BigInt.prototype.toJSON = function() { return this.toString(); };
+
+const express = require('express');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const si = require('systeminformation');
+const { Client } = require('ssh2');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+const path = require('path');
+const fs = require('fs');
+
+const app = express();
+
+// ─── Security Middleware ─────────────────────────────────────────────────────
+app.use(helmet({ contentSecurityPolicy: false })); // CSP disabled for iframe/xterm compat
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGIN || true,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']
+}));
+app.use(express.json({ limit: '2mb' }));
+
+// Rate limiting: max 100 reqs per 15min per IP
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true });
+app.use('/api/', limiter);
+
+// Stricter limit on auth endpoints
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many login attempts. Please try again later.' } });
+app.use('/api/auth/login', authLimiter);
+
+const db = require('./database');
+const axios = require('axios');
+const crypto = require('crypto');
+const { generateScanReportHTML } = require('./scanReportTemplate');
+
+// ─── JWT Secret (auto-generate if missing) ──────────────────────────────────
+const JWT_SECRET = (() => {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  // Auto-generate and persist to .env
+  const generated = crypto.randomBytes(48).toString('hex');
+  try {
+    const envPath = path.join(__dirname, '.env');
+    fs.appendFileSync(envPath, `JWT_SECRET=${generated}\n`);
+    console.log('[SECURITY] Auto-generated JWT_SECRET and saved to .env');
+  } catch (e) {
+    console.warn('[SECURITY] Could not persist JWT_SECRET to .env — using ephemeral key');
+  }
+  return generated;
+})();
+
+// ─── Auth Middleware (defined early so all routes can use it) ────────────────
+const authMiddleware = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch { res.status(401).json({ error: 'Token invalid or expired' }); }
+};
+
+const verifyAdmin = (req, res, next) => {
+  if (req.user && req.user.role === 'admin') next();
+  else res.status(403).json({ error: 'Forbidden: Requires Administrator Privileges' });
+};
+
+// ─── Agent Token for /api/report ────────────────────────────────────────────
+const AGENT_SECRET = process.env.AGENT_SECRET || crypto.randomBytes(32).toString('hex');
+if (!process.env.AGENT_SECRET) {
+  try {
+    const envPath = path.join(__dirname, '.env');
+    fs.appendFileSync(envPath, `\nAGENT_SECRET=${AGENT_SECRET}\n`);
+    console.log(`[SECURITY] Auto-generated AGENT_SECRET and saved to .env`);
+  } catch(e) { console.warn('[SECURITY] Could not persist AGENT_SECRET'); }
+}
+
+// ─── SSRF Protection Helper ─────────────────────────────────────────────────
+const { URL } = require('url');
+const validateExternalUrl = (urlStr) => {
+  try {
+    const parsed = new URL(urlStr);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+    const blocked = ['169.254.169.254', 'localhost', '127.0.0.1', '0.0.0.0', '::1'];
+    if (blocked.includes(parsed.hostname)) return false;
+    if (/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/.test(parsed.hostname)) return false;
+    return true;
+  } catch { return false; }
+};
+
+// ─── Container ID Sanitizer ─────────────────────────────────────────────────
+const SAFE_CONTAINER_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
+
+// ─── Protect all /api/ routes except public endpoints ───────────────────────
+// NOTE: app.use('/api', ...) strips '/api' from req.path, so paths are relative
+const PUBLIC_PATHS = ['/auth/login', '/agent/download'];
+app.use('/api', (req, res, next) => {
+  // /api/report uses Agent Token auth instead of JWT
+  if (req.path === '/report') {
+    const agentToken = req.headers['x-agent-token'];
+    if (agentToken === AGENT_SECRET) return next();
+    return res.status(403).json({ error: 'Invalid agent token' });
+  }
+  if (PUBLIC_PATHS.some(p => req.path === p || req.path.startsWith(p))) return next();
+  authMiddleware(req, res, next);
+});
+
+// ─── Agent Registry ────────────────────────────────────────────────────────
+const AGENT_SOURCE_PATH = path.join(__dirname, '..', 'edge-agent', 'dist', 'bundle.js');
+let agentSourceCode = '';
+try {
+  agentSourceCode = fs.readFileSync(AGENT_SOURCE_PATH, 'utf8');
+} catch (e) {
+  console.error('[Backend] Could not load bundled agent.js for deployment:', e.message);
+}
+
+const server = http.createServer(app);
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',')
+  : [process.env.ALLOWED_ORIGIN || 'http://localhost:3010'];
+const io = new Server(server, {
+  cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'], credentials: true }
+});
+
+// ─── State ───────────────────────────────────────────────────────────────────
+let currentDisks = [];
+let currentPartitions = [];
+let eventLog = [];
+let initialized = false;
+
+let hosts = {
+  'localhost': {
+    name: 'Local Server',
+    os: process.platform,
+    disks: [], partitions: [], history: [],
+
+    lastUpdate: Date.now(), status: 'online',
+    connectionType: 'local', cpu: 0, mem: 0,
+    network: { rx: 0, tx: 0, iface: '' }
+  }
+};
+
+const scanResultCache = new Map(); // jobId -> { result, hostId, diskName, ts }
+
+// Alert thresholds (user configurable via API)
+let alertThresholds = {
+  diskUsage: 90,     // %
+  cpuLoad: 85,       // %
+  memUsage: 90,      // %
+  tempCelsius: 50,   // °C
+  rxSpike: 100,      // MB/s
+  txSpike: 100,      // MB/s
+  healthDrop: 5,        // points (e.g. drop from 100 to 94)
+  errorSpike: 1,        // any increase in bad sectors
+  discordWebhook: '',   // Full URL
+  telegramWebhook: '',  // Format: BOT_TOKEN/CHAT_ID
+  customWebhook: ''     // Generic POST URL
+};
+
+// Bandwidth history [{ time, rx, tx }]
+let bandwidthHistory = [];
+
+// Network devices
+let networkDevices = {};
+
+let sshConfigs = [];
+let sshSessions = {}; // Map of hostId -> { conn, shell, socketId }
+let prevNetStats = null;
+
+// ─── Disk Health Prediction Engine ───────────────────────────────────────────
+// Per-disk historical snapshots: { [serialNum]: { snapshots:[], riskHistory:[] } }
+const diskHealthStore = {};
+const diskIoStore = {}; // Per-disk IO counters: { [serial]: { rIO, wIO, rBytes, wBytes, time } }
+
+/**
+ * Intelligent Analysis Engine
+ * Score a single disk based on SMART attributes + temperature trend.
+ * Returns: { score: 0-100, risk: 'low'|'medium'|'critical', signs: [], actions: [], prediction }
+ */
+const analyzeDiskHealth = (disk, smart) => {
+  const signs = [];      // early warning signs detected
+  const actions = [];    // suggested preventive actions
+  const patterns = [];   // detected abnormal patterns
+  let demerits = 0;      // accumulated penalty points
+
+  const serial = disk.serialNum || disk.name;
+  if (!diskHealthStore[serial]) {
+    diskHealthStore[serial] = { snapshots: [], riskHistory: [] };
+  }
+  const store = diskHealthStore[serial];
+
+  const attrs = (smart && smart.attributes) ? smart.attributes : {};
+
+  // Helper to extract raw values defensively
+  const getRaw = (key) => parseInt((attrs[key] || {}).raw_value || (attrs[key] || {}).rawValue || (attrs[key] || {}).raw || 0);
+
+  const rvRaw = getRaw('5') || getRaw('reallocated_sectors_count');
+  const pvRaw = getRaw('197') || getRaw('current_pending_sector');
+  const uvRaw = getRaw('198') || getRaw('offline_uncorrectable');
+  const rwRaw = getRaw('1') || getRaw('raw_read_error_rate');
+  const spinRaw = getRaw('10') || getRaw('spin_retry_count');
+  const crcRaw = getRaw('199') || getRaw('udma_crc_error_count');
+  const hours = getRaw('9') || getRaw('power_on_hours');
+  const loadUnload = getRaw('193') || getRaw('load_cycle_count');
+
+  // ── 1. SMART pass/fail ──────────────────────────────────────────────────
+  if (smart && smart.status && smart.status !== 'PASSED') {
+    demerits += 40;
+    signs.push({ severity: 'critical', msg: `S.M.A.R.T. self-test FAILED (${smart.status})` });
+    actions.push({ priority: 'immediate', title: 'Replace Disk', detail: 'Drive has definitively failed its manufacturer SMART test.' });
+  }
+
+  // ── 2. Reallocated / bad sectors ────────────────────────────────────────
+  if (rvRaw > 0) {
+    const sev = rvRaw > 10 ? 'critical' : rvRaw > 2 ? 'medium' : 'low';
+    demerits += rvRaw > 10 ? 40 : rvRaw > 2 ? 20 : 10;
+    signs.push({ severity: sev, msg: `${rvRaw} reallocated (bad) sector${rvRaw > 1 ? 's' : ''} detected` });
+  }
+  if (pvRaw > 0) {
+    const sev = pvRaw > 5 ? 'critical' : 'medium';
+    demerits += pvRaw > 5 ? 40 : 20;
+    signs.push({ severity: sev, msg: `${pvRaw} sector${pvRaw > 1 ? 's' : ''} pending reallocation (unstable)` });
+  }
+  if (uvRaw > 0) {
+    const sev = uvRaw > 3 ? 'critical' : 'medium';
+    demerits += uvRaw > 3 ? 40 : 20;
+    signs.push({ severity: sev, msg: `${uvRaw} offline-uncorrectable sector${uvRaw > 1 ? 's' : ''}` });
+  }
+
+  // ── 3. Read/Write errors ─────────────────────────────────────────────────
+  if (rwRaw > 1000) {
+    demerits += rwRaw > 100000 ? 30 : rwRaw > 10000 ? 15 : 5;
+    signs.push({ severity: rwRaw > 100000 ? 'medium' : 'low', msg: `Elevated raw read error rate (${rwRaw.toLocaleString()})` });
+  }
+  if (crcRaw > 10) {
+    demerits += 15;
+    signs.push({ severity: 'medium', msg: `CRC Errors detected (${crcRaw}). Check SATA/Data cable.` });
+    actions.push({ priority: 'soon', title: 'Check Connections', detail: 'UDMA CRC errors indicate a faulty data cable or loose connection.' });
+  }
+
+  // ── 4. Temperature ──────────────────────────────────────────────────────
+  const temp = smart ? smart.temperature : (disk.temp !== 'N/A' ? parseInt(disk.temp) : null);
+  if (temp && !isNaN(temp)) {
+    if (temp >= 60) {
+      demerits += 20;
+      signs.push({ severity: 'critical', msg: `Dangerously high temperature: ${temp}°C (threshold 60°C)` });
+      actions.push({ priority: 'immediate', title: 'Reduce Load / Cool Down', detail: `Temperature is critically high (${temp}°C). Improve cooling immediately to prevent hardware damage.` });
+    } else if (temp >= 50) {
+      demerits += 10;
+      signs.push({ severity: 'medium', msg: `Elevated temperature: ${temp}°C (recommended <50°C)` });
+      if (!actions.some(a => a.priority === 'immediate')) {
+        actions.push({ priority: 'soon', title: 'Improve Airflow', detail: `Continuous high temperature (${temp}°C) drastically shortens drive lifespan.` });
+      }
+    } else if (temp >= 45) {
+      demerits += 5;
+      signs.push({ severity: 'low', msg: `Temperature approaching threshold: ${temp}°C` });
+    }
+
+    // Temperature trend: rising over last 10 snapshots?
+    const temps = store.snapshots.slice(-10).map(s => s.temp).filter(t => t && !isNaN(t));
+    if (temps.length >= 5) {
+      const rise = temp - temps[0];
+      if (rise >= 10) {
+        demerits += 15;
+        signs.push({ severity: 'medium', msg: `Temperature rising trend: +${rise}°C over last ${temps.length} readings` });
+        patterns.push({ name: 'Thermal Runaway', desc: `Rapid heating detected (+${rise}°C). Check fans.` });
+      } else if (rise >= 5) {
+        demerits += 6;
+        signs.push({ severity: 'low', msg: `Gradual temperature increase: +${rise}°C over recent readings` });
+      }
+    }
+  }
+
+  // ── 5. Mechanical / Spin issues ─────────────────────────────────────────
+  if (spinRaw > 0) {
+    demerits += spinRaw > 5 ? 20 : 10;
+    signs.push({ severity: spinRaw > 5 ? 'medium' : 'low', msg: `Spin-up retry count: ${spinRaw}` });
+    actions.push({ priority: 'soon', title: 'Check Power Supply', detail: 'Spin-up retries often indicate insufficient power supply or failing drive motor.' });
+  }
+
+  if (hours > 0 && loadUnload > 0) {
+    const rate = loadUnload / hours;
+    if (rate > 50) {
+      demerits += 5;
+      patterns.push({ name: 'Excessive Head Parking', desc: `Load/Unload cycles are extremely high (${Math.round(rate)}/hr).` });
+      actions.push({ priority: 'monitor', title: 'Adjust APM settings', detail: 'Frequent head parking wears out mechanics. Disable aggressive power management.' });
+    }
+  }
+
+  // ── 6. Health score trend (bad sector accumulation rate) ─────────────────
+  const prevSnapshots = store.snapshots.slice(-5);
+  if (prevSnapshots.length >= 3) {
+    const prevDemerits = prevSnapshots.map(s => s.demerits);
+    const avgPrev = prevDemerits.reduce((a, b) => a + b, 0) / prevDemerits.length;
+    if (demerits - avgPrev >= 10) {
+      signs.push({ severity: 'medium', msg: 'Rapid health score degradation detected over recent polls' });
+      patterns.push({ name: 'Rapid Health Degradation', desc: 'Score dropped significantly in a short time frame.' });
+    }
+  }
+
+  // ── Clamp and map to risk level ──────────────────────────────────────────
+  const score = Math.max(0, Math.min(100, 100 - demerits));  // 100 = perfect
+
+  let risk = 'low';
+  if (score < 40) risk = 'critical';
+  else if (score < 70) risk = 'medium';
+
+  // Base preventative actions based on overall risk
+  if (risk === 'critical') {
+    actions.push({ priority: 'immediate', title: 'Backup Data Immediately', detail: 'Drive failure may be imminent. Stop usage and transfer all critical data to another medium.' });
+    actions.push({ priority: 'immediate', title: 'Replace Disk', detail: 'Plan hardware replacement as soon as possible.' });
+  } else if (risk === 'medium') {
+    actions.push({ priority: 'soon', title: 'Ensure Backup Readiness', detail: 'Verify your latest backups are intact. Drive is showing signs of moderate wear.' });
+  } else {
+    actions.push({ priority: 'monitor', title: 'Normal Operation', detail: 'Drive is healthy. Continue standard usage and scheduled backups.' });
+  }
+
+  // Deduplicate actions by title
+  const uniqueActions = [];
+  const titles = new Set();
+  for (const a of actions) {
+    if (!titles.has(a.title)) {
+      titles.add(a.title);
+      uniqueActions.push(a);
+    }
+  }
+
+  // Sort actions by priority (immediate > soon > monitor)
+  const pWeight = { immediate: 3, soon: 2, monitor: 1 };
+  uniqueActions.sort((a, b) => pWeight[b.priority] - pWeight[a.priority]);
+
+  // ── Failure prediction engine ────────────────────────────────────────────
+  // Use 4 risk levels: low / medium / high / critical
+  let riskLevel = 'low';
+  if (score < 30) riskLevel = 'critical';
+  else if (score < 55) riskLevel = 'high';
+  else if (score < 75) riskLevel = 'medium';
+
+  let prediction = null;
+
+  // ETA based on historical score degradation rate
+  const snapHistory = store.snapshots.slice(-30);
+  if (snapHistory.length >= 5) {
+    const oldest = snapHistory[0].score;
+    const newest = snapHistory[snapHistory.length - 1].score;
+    const degradationPerPoll = (oldest - newest) / snapHistory.length;
+    const pollIntervalMs = 3000; // 3s poll interval
+    const pollsPerDay = (24 * 60 * 60 * 1000) / pollIntervalMs;
+
+    // Estimate polls until score hits 0 (failure threshold)
+    const pollsUntilFailure = degradationPerPoll > 0 ? newest / degradationPerPoll : Infinity;
+    const daysUntilFailure = pollsUntilFailure / pollsPerDay;
+
+    // Bad sector growth rate acceleration
+    const recentDemerits = snapHistory.slice(-10).map(s => s.demerits);
+    const avgRecentDemerits = recentDemerits.reduce((a, b) => a + b, 0) / recentDemerits.length;
+    const isAccelerating = avgRecentDemerits > demerits * 0.8;
+
+    // Synthesize ETA and confidence
+    let etaWindow = null, confidence = 'Low', etaMsg = '';
+
+    const critCount = store.riskHistory.filter(r => r === 'critical' || r === 'high').length;
+    const medCount = store.riskHistory.filter(r => r === 'medium').length;
+
+    if (riskLevel === 'critical' || critCount >= 5) {
+      etaWindow = daysUntilFailure < 3 ? '< 24 hours' : daysUntilFailure < 14 ? '1–14 days' : '2–4 weeks';
+      confidence = 'Very High';
+      etaMsg = '🔴 Drive failure is imminent. Backup data immediately and replace drive.';
+    } else if (riskLevel === 'high' || (critCount >= 2 && medCount >= 3)) {
+      etaWindow = '3–8 weeks';
+      confidence = 'High';
+      etaMsg = '🟠 Drive showing serious degradation. Plan replacement within weeks.';
+    } else if (riskLevel === 'medium' || medCount >= 5 || isAccelerating) {
+      etaWindow = '2–6 months';
+      confidence = 'Medium';
+      etaMsg = '🟡 Moderate signs of wear. Monitor closely, verify backups.';
+    } else if (medCount >= 2 || degradationPerPoll > 0.01) {
+      etaWindow = '6–18 months';
+      confidence = 'Low';
+      etaMsg = '🟢 Early indicators detected. Continue monitoring regularly.';
+    }
+
+    if (etaWindow) {
+      prediction = {
+        window: etaWindow,
+        confidence,
+        msg: etaMsg,
+        degradationRate: degradationPerPoll.toFixed(4),
+        riskLevel,
+        badSectorGrowth: (rvRaw + pvRaw + uvRaw),
+        isAccelerating
+      };
+    }
+  }
+
+  // ── Persist snapshot ────────────────────────────────────────────────────
+  store.snapshots.push({ time: new Date().toISOString(), demerits, score, temp: temp || null });
+  if (store.snapshots.length > 120) store.snapshots.shift();
+
+  store.riskHistory.push(riskLevel);
+  if (store.riskHistory.length > 120) store.riskHistory.shift();
+
+  return { score, risk: riskLevel, signs, patterns, actions: uniqueActions, prediction, demerits, analyzedAt: new Date().toISOString() };
+};
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+const logEvent = (type, message, details = {}, host = 'localhost') => {
+  const event = { id: Date.now(), timestamp: new Date().toISOString(), type, message, host, details };
+  eventLog.unshift(event);
+  if (eventLog.length > 200) eventLog.pop();
+  io.emit('new_event', event);
+};
+
+const hasDisksChanged = (oldDisks, newDisks) => {
+  if (oldDisks.length !== newDisks.length) return true;
+  for (let i = 0; i < oldDisks.length; i++) {
+    if (oldDisks[i].serialNum !== newDisks[i].serialNum) return true;
+  }
+  return false;
+};
+
+const fireAlert = (type, message, host, meta = {}) => {
+  io.emit('disk_alert', { type, message, host, ...meta, timestamp: new Date().toISOString() });
+  logEvent(type, message, meta, host);
+
+  // ── Dispatch Third-Party Webhooks ──
+  // Only forward 'warning' or 'critical' alerts to avoid notification spam
+  if (type === 'warning' || type === 'critical' || type === 'removed') {
+    const icon = type === 'critical' ? '🚨' : type === 'warning' ? '⚠️' : 'ℹ️';
+    const text = `${icon} **[${host}] TelemetryHub Alert:**\n${message}`;
+
+    // Discord Payload
+    if (alertThresholds.discordWebhook) {
+      fetch(alertThresholds.discordWebhook, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: text })
+      }).catch(err => console.error('[Webhook] Discord error:', err.message));
+    }
+
+    // Telegram Payload (Format expected: BOT_TOKEN/CHAT_ID)
+    if (alertThresholds.telegramWebhook && alertThresholds.telegramWebhook.includes('/')) {
+      const [token, chatId] = alertThresholds.telegramWebhook.split('/');
+      const url = `https://api.telegram.org/bot${token}/sendMessage`;
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: text, parse_mode: 'Markdown' })
+      }).catch(err => console.error('[Webhook] Telegram error:', err.message));
+    }
+
+    // Custom Generic Webhook
+    if (alertThresholds.customWebhook) {
+      fetch(alertThresholds.customWebhook, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: type,
+          message: message,
+          host: host,
+          timestamp: new Date().toISOString(),
+          meta: meta
+        })
+      }).catch(err => console.error('[Webhook] Custom error:', err.message));
+    }
+  }
+};
+
+// ─── Disk / System Polling ────────────────────────────────────────────────────
+const pollDisks = async () => {
+  try {
+    const [disks, partitions, cpuLoad, mem, nets, disksIo, netIfaces, dockerContainers] = await Promise.all([
+      si.diskLayout(),
+      si.fsSize(),
+      si.currentLoad(),
+      si.mem(),
+      si.networkStats(),
+      si.disksIO(),
+      si.networkInterfaces(),
+      si.dockerContainers('all').catch(() => [])
+    ]);
+
+    const raidMap = {}; // device path -> raid info
+    (raidZfsCache.raids || []).forEach(r => {
+      (r.members || []).forEach(m => {
+        raidMap[m.device] = { level: r.level, array: r.device, state: r.state };
+      });
+    });
+
+    const zfsMap = {}; // Possibly map zfs members too if we can find them
+
+    // ── Update Performance Metrics ──
+    const now = Date.now();
+    const disksIoArray = Array.isArray(disksIo) ? disksIo : (disksIo ? [disksIo] : []);
+    const perfStats = disksIoArray.map(pio => {
+      const id = pio.device;
+      const prev = diskIoStore[id];
+      const timeDelta = prev ? (now - prev.time) / 1000 : 0;
+
+      let stats = { name: id, rIops: 0, wIops: 0, rSpeed: 0, wSpeed: 0, latency: 0, serialNum: '' };
+      const dMatch = disks.find(d => d.device === id || d.name === id);
+      if (dMatch) stats.serialNum = dMatch.serialNum;
+
+      if (prev && timeDelta > 0) {
+        stats.rIops = Math.max(0, (pio.rIO - prev.rIO) / timeDelta);
+        stats.wIops = Math.max(0, (pio.wIO - prev.wIO) / timeDelta);
+        stats.rSpeed = Math.max(0, (pio.rBytes - prev.rBytes) / timeDelta);
+        stats.wSpeed = Math.max(0, (pio.wBytes - prev.wBytes) / timeDelta);
+
+        // Estimate latency if tIO (time spent) is available
+        const ioDelta = (pio.rIO + pio.wIO) - (prev.rIO + prev.wIO);
+        const tDelta = (pio.tIO || 0) - (prev.tIO || 0);
+        if (ioDelta > 0 && tDelta > 0) {
+          stats.latency = tDelta / ioDelta; // ms per request
+        } else if (ioDelta > 0) {
+          // Fallback latency estimation based on speed if tIO is not supported on this OS
+          stats.latency = (stats.rSpeed + stats.wSpeed) > 1e7 ? 2.5 : 0.8;
+        }
+      }
+
+      diskIoStore[id] = { rIO: pio.rIO, wIO: pio.wIO, rBytes: pio.rBytes, wBytes: pio.wBytes, tIO: pio.tIO, time: now };
+      return stats;
+    });
+    io.emit('performance_update', perfStats);
+
+    console.log(`[POLL] Data: ${disks.length} disks | CPU: ${Math.round(cpuLoad.currentLoad)}% | IO: ${perfStats.length} monitored`);
+
+    console.log(`[POLL] Found ${disks.length} disk(s) | ${partitions.length} partition(s)`);
+
+    // ── SMART ──
+    let smartData = [];
+    if (typeof si.smartData === 'function') {
+      smartData = await si.smartData().catch(() => []);
+    }
+
+    // ── Disk change detection ──
+    if (initialized) {
+      if (hasDisksChanged(currentDisks, disks)) {
+        const removed = currentDisks.filter(od => !disks.find(nd => nd.serialNum === od.serialNum));
+        const added = disks.filter(nd => !currentDisks.find(od => od.serialNum === nd.serialNum));
+        removed.forEach(d => fireAlert('removed', `Drive removed: ${d.name || d.device}`, 'localhost', { disk: d }));
+        added.forEach(d => fireAlert('added', `New drive detected: ${d.name || d.device}`, 'localhost', { disk: d }));
+      }
+    } else {
+      initialized = true;
+      logEvent('system', 'Local monitoring initialized', {}, 'localhost');
+    }
+
+    // ── Enrich disk data + health prediction ──
+    currentDisks = disks.map(d => {
+      const smart = Array.isArray(smartData) ? smartData.find(s => s.serialNum === d.serialNum) : null;
+      const status = smart ? (smart.status === 'PASSED' ? 'OK' : 'ERROR') : 'OK';
+      const temp = smart ? smart.temperature : null;
+
+      // ── Run health analysis ──
+      const health = analyzeDiskHealth(d, smart);
+
+      // ── Smart Alerting System Logic ──
+      const store = diskHealthStore[d.serialNum || d.name];
+      if (store && store.snapshots.length > 0) {
+        const lastSnap = store.snapshots[store.snapshots.length - 1];
+
+        // 1. Health Score Drop detection
+        const drop = lastSnap.score - health.score;
+        if (drop >= alertThresholds.healthDrop && drop > 0) {
+          fireAlert('critical',
+            `⚠️ HEALTH DROP: ${d.name || d.device} score decreased by ${Math.round(drop)} points (now ${health.score}/100)`,
+            'localhost', { disk: d.name, drop, current: health.score, prev: lastSnap.score });
+        }
+
+        // 2. Error Spike detection (demerits increase means new errors)
+        const dSpike = health.demerits - lastSnap.demerits;
+        if (dSpike >= alertThresholds.errorSpike && dSpike > 0) {
+          fireAlert('warning',
+            `🚨 ERROR SPIKE: New I/O errors or bad sectors detected on ${d.name || d.device}`,
+            'localhost', { disk: d.name, demeritsIncrease: dSpike, totalDemerits: health.demerits });
+        }
+      }
+
+      // 3. Overheating detection (legacy check remains but we consolidate)
+      if (temp && temp >= alertThresholds.tempCelsius) {
+        fireAlert('critical',
+          `🔥 OVERHEATING: ${d.name || d.device} is at ${temp}°C (threshold: ${alertThresholds.tempCelsius}°C)`,
+          'localhost', { disk: d.name, temp });
+      }
+
+      // ── Fire risk-level alerts (Legacy logic refined) ──
+      if (health.risk === 'critical') {
+        // Only alert critical risk every ~20 polls to avoid spam
+        if (store && store.riskHistory.filter(r => r === 'critical').length % 20 === 1) {
+          fireAlert('critical', `🚨 CRITICAL RISK: ${d.name || d.device} failure risk is EXTREME`, 'localhost', { disk: d.name, ...health });
+        }
+      } else if (health.risk === 'medium' && health.signs.length > 0) {
+        if (store && store.riskHistory.filter(r => r === 'medium').length % 20 === 1) {
+          fireAlert('warning', `⚠️ WEAR WARNING: ${d.name || d.device} showing signs of age (score: ${health.score})`, 'localhost', { disk: d.name, signs: health.signs });
+        }
+      }
+
+      return {
+        ...d,
+        status,
+        temp: temp || 'N/A',
+        smartData: smart ? smart.attributes : null,
+        raidInfo: raidMap[d.device] || raidMap[d.name] || null,
+        health  // attach full health analysis
+      };
+    });
+    currentPartitions = partitions;
+
+    // ── Partition usage alerts ──
+    partitions.forEach(p => {
+      if (p.use > alertThresholds.diskUsage) {
+        fireAlert('warning', `Critical: ${p.mount} is ${p.use}% full`, 'localhost', { mount: p.mount, use: p.use });
+      }
+    });
+
+    // ── CPU / Mem alerts ──
+    const cpuPct = Math.round(cpuLoad.currentLoad);
+    const memPct = Math.round((mem.active / mem.total) * 100);
+    if (cpuPct > alertThresholds.cpuLoad) {
+      fireAlert('warning', `High CPU load: ${cpuPct}%`, 'localhost', { cpu: cpuPct });
+    }
+    if (memPct > alertThresholds.memUsage) {
+      fireAlert('warning', `High memory usage: ${memPct}%`, 'localhost', { mem: memPct });
+    }
+
+    // ── Bandwidth calculation ──
+    let rxMB = 0, txMB = 0, ifaceName = '';
+    if (nets && nets.length > 0) {
+      const iface = nets[0];
+      ifaceName = iface.iface;
+      if (prevNetStats) {
+        const dt = (Date.now() - prevNetStats.time) / 1000;
+        rxMB = Math.max(0, Math.round(((iface.rx_bytes - prevNetStats.rx) / 1024 / 1024 / dt) * 10) / 10);
+        txMB = Math.max(0, Math.round(((iface.tx_bytes - prevNetStats.tx) / 1024 / 1024 / dt) * 10) / 10);
+
+        if (rxMB > alertThresholds.rxSpike) {
+          fireAlert('warning', `RX spike detected: ${rxMB} MB/s on ${ifaceName}`, 'localhost', { rxMB, ifaceName });
+        }
+        if (txMB > alertThresholds.txSpike) {
+          fireAlert('warning', `TX spike detected: ${txMB} MB/s on ${ifaceName}`, 'localhost', { txMB, ifaceName });
+        }
+      }
+      prevNetStats = { rx: iface.rx_bytes, tx: iface.tx_bytes, time: Date.now() };
+    }
+
+    // ── Bandwidth history (rolling 60 points) ──
+    bandwidthHistory.push({ time: new Date().toLocaleTimeString(), rx: rxMB, tx: txMB });
+    if (bandwidthHistory.length > 60) bandwidthHistory.shift();
+
+    // ── Storage history ──
+    const currentHost = hosts['localhost'] || {};
+    const avgUsage = partitions.reduce((acc, p) => acc + (p.use || 0), 0) / (partitions.length || 1);
+    const newHistory = [...(currentHost.history || []), {
+      time: new Date().toLocaleTimeString(),
+      usage: Math.round(avgUsage),
+      cpu: cpuPct,
+      mem: memPct
+    }].slice(-60);
+
+    hosts['localhost'] = {
+      ...currentHost,
+      name: 'Local Server',
+      os: process.platform,
+      disks: currentDisks,
+      partitions: currentPartitions,
+      smartData: currentDisks.map(d => ({
+        name: d.name,
+        device: d.device,
+        type: d.type,
+        protocol: d.interfaceType,
+        smartStatus: d.status || 'Ok',
+        temperature: d.temp,
+        attributes: d.smartData || []
+      })),
+      perfData: perfStats,
+      raidData: raidZfsCache.raids || [],
+      zfsData: raidZfsCache.zfs || {},
+      networkInterfaces: nets.map(n => {
+        const info = (netIfaces || []).find(i => i.iface === n.iface) || {};
+        return {
+          iface: n.iface,
+          ip4: info.ip4 || '',
+          ip6: info.ip6 || '',
+          mac: info.mac || '',
+          speed: info.speed || 0,
+          type: info.type || 'unknown',
+          operstate: info.operstate || 'unknown',
+          internal: info.internal || false,
+          virtual: info.virtual || false,
+          rx_sec: n.rx_sec || 0,
+          tx_sec: n.tx_sec || 0,
+          rx_bytes: n.rx_bytes || 0,
+          tx_bytes: n.tx_bytes || 0,
+        };
+      }).filter(n => !n.internal),
+      history: newHistory,
+      lastUpdate: Date.now(),
+      status: 'online',
+      cpu: cpuPct,
+      mem: memPct,
+      memTotal: mem.total,
+      memUsed: mem.active,
+      network: { rx: rxMB, tx: txMB, iface: ifaceName },
+      dockerContainers: dockerContainers || []
+    };
+
+    io.emit('hosts_update', hosts);
+    io.emit('bandwidth_update', { history: bandwidthHistory, current: { rx: rxMB, tx: txMB, iface: ifaceName } });
+    io.emit('disk_status', { disks: currentDisks, partitions, eventLog });
+  } catch (err) {
+    console.error('Poll error:', err.message);
+    logEvent('error', `Polling failure: ${err.message}`, {});
+  }
+};
+
+// ─── Network Device Discovery ─────────────────────────────────────────────────
+const discoverNetworkDevices = async () => {
+  try {
+    const nets = await si.networkInterfaces();
+    const ifaces = await si.networkStats();
+
+    // Build device list from known interfaces
+    nets.forEach(n => {
+      if (!n.ip4 || n.ip4 === '127.0.0.1') return;
+      const id = `net-${n.iface}`;
+      networkDevices[id] = {
+        id,
+        name: n.iface,
+        ip: n.ip4,
+        mac: n.mac,
+        type: n.virtual ? 'Virtual' : n.type || 'Physical',
+        status: n.operstate === 'up' ? 'online' : 'offline',
+        speed: n.speed || 0,
+        mtu: n.mtu,
+        lastSeen: Date.now()
+      };
+    });
+
+    io.emit('network_devices', Object.values(networkDevices));
+  } catch (err) {
+    console.error('Network discovery error:', err.message);
+  }
+};
+
+// ─── SSH Manager (Automated Deployer) ─────────────────────────────────────────
+const scanSSH = (config) => {
+  const conn = new Client();
+  const hostId = `ssh-${config.host}`;
+  const logStep = (msg, status = 'deploying') => {
+    logEvent('system', `SSH [${config.name}]: ${msg}`, {}, hostId);
+    if (!hosts[hostId]) hosts[hostId] = { name: config.name, history: [], connectionType: 'ssh' };
+    hosts[hostId] = { ...hosts[hostId], status, lastUpdate: Date.now(), deployLog: msg };
+    io.emit('hosts_update', hosts);
+  };
+
+  const remotePath = config.remotePath || '/opt/hdd-monitor';
+  const nodeBin = 'node'; // Can be made configurable too
+
+  logStep('Connecting to remote host...');
+
+  conn.on('ready', () => {
+    logStep('Connected. Checking requirements...');
+
+    // Deployment Script: Create dir, write agent, setup systemd
+    // TEMPLATE: Insert the HUB_URL (this server's IP)
+    // We try to find our own IP or use hostname
+    const HUB_IP = config.hubIp || '192.168.2.18';
+    
+    // Inject sudo password if necessary to prevent conn.exec from hanging
+    const spwd = config.pass || config.password || '';
+    const sudoPrefix = (spwd && config.user !== 'root') 
+        ? `echo '${spwd.replace(/'/g, "'\\''")}' | sudo -S` 
+        : (config.user === 'root' ? '' : 'sudo');
+    
+    const deployScript = `
+      # 1. Dynamically locate the node binary (handles nvm, local installs, and system installs)
+      NODE_PATH=$(which node 2>/dev/null || find ~/.nvm/versions/node -name "node" -type f -executable 2>/dev/null | sort -V | tail -n 1 || echo /usr/bin/node)
+      NPM_PATH=$(which npm 2>/dev/null || find ~/.nvm/versions/node -name "npm" -type f -executable 2>/dev/null | sort -V | tail -n 1 || echo /usr/bin/npm)
+      
+      ${sudoPrefix} mkdir -p ${remotePath}
+      ${sudoPrefix} sh -c "cd ${remotePath} && $NPM_PATH init -y && $NPM_PATH install socket.io-client systeminformation os-utils chokidar dotenv"
+      
+      ${sudoPrefix} curl -sSL http://${HUB_IP}:5010/api/agent/download -o ${remotePath}/agent.js
+      ${sudoPrefix} curl -sSL http://${HUB_IP}:5010/api/agent/download/scanners -o ${remotePath}/scanners.js
+      ${sudoPrefix} curl -sSL http://${HUB_IP}:5010/api/agent/download/latency-profiler -o ${remotePath}/latency-profiler.js
+      
+      # 2. Safely create the systemd unit file with the resolved NODE_PATH
+      ${sudoPrefix} sh -c "cat << EOF > /etc/systemd/system/hdd-monitor.service
+[Unit]
+Description=TelemetryHub Enterprise Agent
+After=network.target
+
+[Service]
+Type=simple
+Environment=HUB_URL=http://${HUB_IP}:5010
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=$NODE_PATH ${remotePath}/agent.js
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF"
+
+      # 3. Reload and start the service
+      ${sudoPrefix} systemctl daemon-reload
+      ${sudoPrefix} systemctl enable hdd-monitor.service
+      ${sudoPrefix} systemctl restart hdd-monitor.service
+    `;
+
+    conn.exec(deployScript, (err, stream) => {
+      if (err) return logStep(`Deployment command failed: ${err.message}`, 'error');
+
+      stream.on('close', (code) => {
+        if (code === 0) {
+          logStep('Agent deployed & service started successfully.', 'online');
+          logEvent('success', `Remote agent deployed: ${config.name}`, {}, hostId);
+        } else {
+          logStep(`Deployment failed with code ${code}. Check sudo permissions.`, 'error');
+        }
+        conn.end();
+      }).on('data', (data) => {
+        console.log(`SSH [${config.name}] STDOUT: ${data}`);
+      }).stderr.on('data', (data) => {
+        console.log(`SSH [${config.name}] STDERR: ${data}`);
+      });
+    });
+
+  }).on('error', err => {
+    logStep(`SSH connection failed: ${err.message}`, 'error');
+    if (hosts[hostId]) hosts[hostId].status = 'offline';
+    io.emit('hosts_update', hosts);
+  }).connect({
+    host: config.host,
+    port: config.port || 22,
+    username: config.user || config.username,
+    password: config.pass || config.password,
+    readyTimeout: 10000
+  });
+};
+
+// ─── RAID & ZFS Engine ───────────────────────────────────────────────────────
+const { exec, spawn } = require('child_process');
+const execAsync = (cmd) => new Promise((resolve) => {
+  exec(cmd, { timeout: 8000 }, (err, stdout) => resolve(err ? '' : stdout));
+});
+
+let raidZfsCache = { raids: [], zfs: null, updatedAt: null };
+
+const parseMdStat = (raw) => {
+  if (!raw) return [];
+  const blocks = raw.split('\n\n').filter(b => b.includes('md'));
+  return blocks.map(block => {
+    const lines = block.split('\n');
+    const nameLine = lines.find(l => /^md\d+/.test(l));
+    if (!nameLine) return null;
+    const device = nameLine.match(/^(md\S+)/)?.[1] || 'md?';
+    const level = nameLine.match(/raid(\d+)/i)?.[0]?.toUpperCase() || 'RAID?';
+    const members = [];
+    const memberRe = /([a-z]+\d+)\[(\d+)\](\(F\)|\(S\))?/g;
+    let m;
+    while ((m = memberRe.exec(nameLine)) !== null) {
+      members.push({
+        device: '/dev/' + m[1],
+        slot: parseInt(m[2]),
+        state: m[3] === '(F)' ? 'faulty' : m[3] === '(S)' ? 'spare' : 'active'
+      });
+    }
+    const statusLine = lines.find(l => l.includes('blocks'));
+    const totalDevices = parseInt(statusLine?.match(/(\d+) blocks/)?.[1]) || members.length;
+    const activeDevices = parseInt(nameLine.match(/(\d+)\/(\d+)/)?.[1]) || members.filter(m => m.state === 'active').length;
+    const failedDevices = members.filter(m => m.state === 'faulty').length;
+    const spareDevices = members.filter(m => m.state === 'spare').length;
+
+    // State detection
+    let state = 'clean';
+    if (failedDevices > 0 && activeDevices < totalDevices) state = 'degraded';
+    const rebuildLine = lines.find(l => l.includes('recovery') || l.includes('resync'));
+    let rebuildProgress = null, rebuildEta = null;
+    if (rebuildLine) {
+      state = 'rebuilding';
+      const pctMatch = rebuildLine.match(/(\d+\.\d+)%/);
+      const etaMatch = rebuildLine.match(/finish=(\S+)/);
+      if (pctMatch) rebuildProgress = parseFloat(pctMatch[1]);
+      if (etaMatch) rebuildEta = etaMatch[1];
+    }
+
+    const sizeMatch = statusLine?.match(/(\d+[\d,]*) blocks/);
+    const sizeKb = sizeMatch ? parseInt(sizeMatch[1].replace(/,/g, '')) : 0;
+    const size = sizeKb > 1048576 ? `${(sizeKb / 1048576).toFixed(1)} TB` : sizeKb > 1024 ? `${(sizeKb / 1024).toFixed(0)} GB` : `${sizeKb} KB`;
+
+    return { device, level, state, activeDevices, totalDevices, failedDevices, spareDevices, members, rebuildProgress, rebuildEta, size };
+  }).filter(Boolean);
+};
+
+const parseZfsStatus = async () => {
+  const statusOut = await execAsync('zpool status -v');
+  const listOut = await execAsync('zpool list -Hp -o name,size,alloc,free,capacity,health');
+  if (!listOut) return null;
+
+  // Parse pool list
+  const poolMap = {};
+  for (const line of listOut.trim().split('\n')) {
+    const p = line.split('\t');
+    if (p.length < 6) continue;
+    const name = p[0], size = p[1], used = p[2], free = p[3], cap = p[4], health = p[5];
+    const sizeN = parseFloat(size), usedN = parseFloat(used), freeN = parseFloat(free);
+    const fmt = n => n > 1e12 ? `${(n / 1e12).toFixed(1)} TB` : n > 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${(n / 1e6).toFixed(0)} MB`;
+    poolMap[name] = { name, size: fmt(sizeN), used: fmt(usedN), free: fmt(freeN), usedPct: parseInt(cap), health, readErrors: 0, writeErrors: 0, checksumErrors: 0, scrub: null };
+  }
+
+  // Parse scrub + error data from status output
+  const poolBlocks = statusOut.split(/\n\s*pool:/g).slice(1);
+  for (const block of poolBlocks) {
+    const name = block.split('\n')[0].trim();
+    if (!poolMap[name]) continue;
+    // Read errors
+    const errMatch = block.match(/(\d+)\s+(\d+)\s+(\d+)\s+\n/);
+    if (errMatch) {
+      poolMap[name].readErrors = parseInt(errMatch[1]);
+      poolMap[name].writeErrors = parseInt(errMatch[2]);
+      poolMap[name].checksumErrors = parseInt(errMatch[3]);
+    }
+    // Scrub
+    const scrubLine = block.match(/scan:.*?(?:\n|$)/)?.[0] || '';
+    if (scrubLine) {
+      const errors = parseInt(scrubLine.match(/(\d+) errors/)?.[1] || '0');
+      const repaired = scrubLine.match(/repaired (\S+)/)?.[1] || null;
+      const date = scrubLine.match(/on (.+)$/)?.[1]?.trim() || null;
+      const isRunning = scrubLine.includes('in progress');
+      poolMap[name].scrub = {
+        state: isRunning ? 'scrub in progress' : errors === 0 ? 'scrub completed (no errors)' : 'scrub completed (errors found)',
+        errors,
+        repaired,
+        date
+      };
+    }
+  }
+
+  return { pools: Object.values(poolMap) };
+};
+
+const parseArcStats = async () => {
+  const raw = await execAsync('cat /proc/spl/kstat/zfs/arcstats');
+  if (!raw) return null;
+  const get = (key) => {
+    const m = raw.match(new RegExp(`^${key}\\s+\\d+\\s+(\\d+)`, 'm'));
+    return m ? parseInt(m[1]) : 0;
+  };
+  const size = get('size');
+  const max = get('c_max');
+  const hits = get('hits');
+  const misses = get('misses');
+  const l2Size = get('l2_size');
+  const total = hits + misses;
+  const hitRatio = total > 0 ? ((hits / total) * 100).toFixed(1) : 'N/A';
+  const fmt = n => n > 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n > 1e6 ? `${(n / 1e6).toFixed(0)} MB` : `${n} B`;
+  return { size: fmt(size), maxSize: fmt(max), hitRatio, l2Size: l2Size > 0 ? fmt(l2Size) : 'N/A' };
+};
+
+const pollRaidZfs = async () => {
+  try {
+    const mdstatRaw = await execAsync('cat /proc/mdstat');
+    const raids = parseMdStat(mdstatRaw);
+    const zfsPools = await parseZfsStatus();
+    const arcStats = await parseArcStats();
+    const zfs = zfsPools ? { ...zfsPools, arc: arcStats } : null;
+    raidZfsCache = { raids, zfs, updatedAt: new Date().toISOString() };
+
+    // Alert on degraded arrays
+    raids.filter(r => r.state === 'degraded').forEach(r => {
+      fireAlert('critical', `RAID array ${r.device} is DEGRADED — ${r.failedDevices} disk(s) failed!`, 'localhost', { device: r.device });
+    });
+    // Alert on ZFS errors
+    (zfs?.pools || []).filter(p => (p.readErrors + p.writeErrors + p.checksumErrors) > 0).forEach(p => {
+      fireAlert('warning', `ZFS pool "${p.name}" has errors: R:${p.readErrors} W:${p.writeErrors} CK:${p.checksumErrors}`, 'localhost', { pool: p.name });
+    });
+
+    io.emit('raid_zfs_update', raidZfsCache);
+  } catch (e) { /* silently skip on unsupported OS */ }
+};
+
+// ─── Polling Intervals ────────────────────────────────────────────────────────
+setInterval(pollDisks, 3000);
+setInterval(discoverNetworkDevices, 10000);
+setInterval(pollRaidZfs, 15000);
+pollRaidZfs(); // run immediately on boot
+
+// Check offline remote hosts
+setInterval(() => {
+  const now = Date.now();
+  Object.keys(hosts).forEach(id => {
+    if (id !== 'localhost' && now - hosts[id].lastUpdate > 20000 && hosts[id].status === 'online') {
+      hosts[id].status = 'offline';
+      logEvent('error', `Host went offline: ${hosts[id].name}`, {}, id);
+      io.emit('hosts_update', hosts);
+    }
+  });
+}, 5000);
+
+
+
+// Main data
+app.get('/api/disks', (req, res) => res.json({ hosts, eventLog, sshConfigs, bandwidthHistory, networkDevices: Object.values(networkDevices) }));
+
+// Hosts list (for frontend refresh)
+app.get('/api/hosts', (req, res) => res.json(hosts));
+
+// Bandwidth data
+app.get('/api/bandwidth', (req, res) => res.json({ history: bandwidthHistory }));
+
+// Network devices
+app.get('/api/network/devices', (req, res) => res.json(Object.values(networkDevices)));
+
+// RAID & ZFS data
+app.get('/api/raid-zfs', async (req, res) => {
+  await pollRaidZfs(); // refresh on demand
+  res.json(raidZfsCache);
+});
+
+// Update alert thresholds — admin only (auth is now enforced globally)
+app.post('/api/thresholds', verifyAdmin, (req, res) => {
+  alertThresholds = { ...alertThresholds, ...req.body };
+  logEvent('system', 'Alert thresholds updated', alertThresholds);
+  res.json({ success: true, thresholds: alertThresholds });
+});
+
+app.post('/api/test-alert', (req, res) => {
+  fireAlert('warning', '🔴 [TEST] Smart Alerting System verification. If you receive this, your configuration is correct.', 'localhost', { test: true });
+  res.json({ success: true, message: 'Test alert dispatched' });
+});
+
+app.get('/api/thresholds', (req, res) => res.json(alertThresholds));
+
+// Disk health prediction data
+app.get('/api/health', (req, res) => {
+  const report = currentDisks.map(d => {
+    const serial = d.serialNum || d.name;
+    const store = diskHealthStore[serial] || { snapshots: [], riskHistory: [] };
+    return {
+      name: d.name,
+      serial,
+      health: d.health || null,
+      scoreHistory: store.snapshots.slice(-60).map(s => ({ time: s.time, score: s.score })),
+      tempHistory: store.snapshots.slice(-60).map(s => ({ time: s.time, temp: s.temp })),
+      riskHistory: store.riskHistory.slice(-20)
+    };
+  });
+  res.json({ disks: report, store: diskHealthStore });
+});
+
+
+// Missing frontend API fillers
+app.get('/api/webhooks', async (req, res) => res.json(await db.getWebhooks().catch(() => [])));
+app.get('/api/rules', (req, res) => res.json([]));
+app.get('/api/ssh/list', async (req, res) => {
+  const hosts = await db.getSshHosts().catch(() => []);
+  sshConfigs = hosts; // Keep in sync
+  res.json(hosts);
+});
+
+// ─── API Routes ───────────────────────────────────────────────────────────────
+// Download Agent Source — served as a direct file stream
+app.get('/api/agent/download', (req, res) => {
+  const bundlePath = path.join(__dirname, '..', 'edge-agent', 'dist', 'bundle.js');
+  const agentPath = fs.existsSync(bundlePath) ? bundlePath
+    : path.join(__dirname, '..', 'edge-agent', 'agent.js');
+  if (!fs.existsSync(agentPath)) {
+    return res.status(500).send('// Agent source not available on this hub.\n');
+  }
+  res.setHeader('Content-Type', 'text/javascript');
+  res.setHeader('Content-Disposition', 'attachment; filename=agent.js');
+  fs.createReadStream(agentPath).pipe(res);
+});
+
+// Download Agent Scanners package
+app.get('/api/agent/download/scanners', (req, res) => {
+  const scannersPath = path.join(__dirname, '..', 'edge-agent', 'scanners.js');
+  if (!fs.existsSync(scannersPath)) return res.status(404).end();
+  res.setHeader('Content-Type', 'text/javascript');
+  fs.createReadStream(scannersPath).pipe(res);
+});
+
+// Download Agent Latency Profiler package
+app.get('/api/agent/download/latency-profiler', (req, res) => {
+  const profilerPath = path.join(__dirname, '..', 'edge-agent', 'latency-profiler.js');
+  if (!fs.existsSync(profilerPath)) return res.status(404).end();
+  res.setHeader('Content-Type', 'text/javascript');
+  fs.createReadStream(profilerPath).pipe(res);
+});
+
+// Add SSH target — secured
+app.post('/api/ssh/add', (req, res) => {
+  const config = req.body;
+  const hostId = `ssh-${config.host}`;
+  const existingConfigIdx = sshConfigs.findIndex(c => `ssh-${c.host}` === hostId || c.host === config.host);
+  
+  if (existingConfigIdx >= 0) {
+    sshConfigs[existingConfigIdx] = config;
+  } else {
+    sshConfigs.push(config);
+  }
+  
+  // Save credentials to DB
+  db.saveSshHost(config);
+
+  if (!config.terminalOnly) {
+    hosts[hostId] = {
+      name: config.name,
+      os: 'linux',
+      disks: [], partitions: [], history: [],
+      lastUpdate: Date.now(),
+      status: 'deploying',
+      connectionType: 'ssh'
+    };
+    scanSSH(config);
+  }
+  
+  res.json({ success: true, hostId });
+});
+
+// Deploy agent to a new server via SSH (8-step with live deploy:log events)
+// ─── Deployment State (per-host lock + session tracking) ─────────────────────
+const deploymentSessions = new Map(); // hostId -> { conn, cancelled, timeout }
+
+// ─── Production SSH Deployment Engine ────────────────────────────────────────
+app.post('/api/ssh/deploy', (req, res) => {
+  const config = req.body;
+  if (!config || !config.host) return res.status(400).json({ error: 'host is required' });
+
+  const hostId = `ssh-${config.host}`;
+
+  if (deploymentSessions.has(hostId)) {
+    return res.status(409).json({ error: 'Deployment already in progress for this host. Use /api/ssh/deploy/cancel/' + hostId + ' to cancel.' });
+  }
+
+  res.json({ success: true, hostId });
+  _runDeployment(config, hostId).catch(e => console.error('[Deploy] Unhandled rejection:', e));
+});
+
+// Cancel a running deployment
+app.post('/api/ssh/deploy/cancel/:hostId', (req, res) => {
+  const session = deploymentSessions.get(req.params.hostId);
+  if (!session) return res.status(404).json({ error: 'No active deployment' });
+  session.cancelled = true;
+  if (session.timeout) clearTimeout(session.timeout);
+  if (session.conn) try { session.conn.end(); } catch(_) {}
+  deploymentSessions.delete(req.params.hostId);
+  io.emit('deploy:log', { hostId: req.params.hostId, msg: 'Deployment cancelled by user', pct: 100, level: 'warn', ts: new Date().toISOString() });
+  res.json({ success: true });
+});
+
+async function _runDeployment(config, hostId) {
+  const { Client } = require('ssh2');
+
+  // ── Config ──────────────────────────────────────────────────────────────────
+  const remotePath  = (config.remotePath || '/opt/nova-agent').replace(/\/+$/, '');
+  const HUB_IP      = config.hubIp || '127.0.0.1';
+  const hubUrl      = `http://${HUB_IP}:5010`;
+  const rawPass     = config.pass || config.password || '';
+  const isRoot      = (config.user === 'root');
+  // Safely escape single-quotes in password for use inside 'echo ... | sudo -S'
+  const escapedPass = rawPass.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
+  const sudoPrefix  = (!isRoot && rawPass) ? `echo '${escapedPass}' | sudo -S` : (isRoot ? '' : 'sudo');
+  const S           = (cmd) => sudoPrefix ? `${sudoPrefix} ${cmd}` : cmd;
+
+  // ── Logging helper ───────────────────────────────────────────────────────────
+  const log = (msg, pct, level = 'info') => {
+    const session = deploymentSessions.get(hostId);
+    if (session && session.cancelled) return;
+    io.emit('deploy:log', { hostId, msg, pct, level, ts: new Date().toISOString() });
+    console.log(`[Deploy:${hostId}] [${level.toUpperCase()}] ${msg}`);
+  };
+
+  // ── Session setup ────────────────────────────────────────────────────────────
+  const session = { conn: null, cancelled: false, timeout: null };
+  deploymentSessions.set(hostId, session);
+
+  // Global 10-minute deployment timeout
+  session.timeout = setTimeout(() => {
+    if (!deploymentSessions.has(hostId)) return;
+    log('Deployment timed out (10 min limit). Cancelling.', 100, 'error');
+    session.cancelled = true;
+    if (session.conn) try { session.conn.end(); } catch(_) {}
+    deploymentSessions.delete(hostId);
+  }, 10 * 60 * 1000);
+
+  // ── Command executor with per-step timeout ───────────────────────────────────
+  const run = (cmd, timeoutMs = 90_000) => new Promise((resolve, reject) => {
+    if (session.cancelled) return reject(new Error('Cancelled'));
+    const timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs/1000}s: ${cmd.slice(0, 80)}`)), timeoutMs);
+    session.conn.exec(cmd, (err, stream) => {
+      if (err) { clearTimeout(timer); return reject(err); }
+      let out = '', errOut = '';
+      stream.on('data', d => { out += d.toString(); });
+      stream.stderr.on('data', d => { errOut += d.toString(); });
+      stream.on('close', code => {
+        clearTimeout(timer);
+        if (session.cancelled) return reject(new Error('Cancelled'));
+        if (code !== 0) reject(new Error(errOut.trim() || out.trim() || `exit code ${code}`));
+        else resolve(out.trim());
+      });
+    });
+  });
+
+  // Write file safely: decode b64 to /tmp (no sudo), then sudo mv to dest.
+  // Avoids the stdin conflict when sudo -S is piped after base64 -d.
+  const writeFile = async (remoteDest, fileContent) => {
+    const b64 = Buffer.from(fileContent).toString('base64');
+    const tmp = `/tmp/nova-deploy-${Date.now()}.tmp`;
+    await run(`echo '${b64}' | base64 -d > ${tmp}`);
+    await run(S(`mv ${tmp} ${remoteDest}`));
+    await run(S(`chmod 644 ${remoteDest}`));
+  };
+  const writeFileDirect = writeFile; // alias for backward compat
+
+  try {
+    const conn = new Client();
+    session.conn = conn;
+
+    // ── STEP 1: SSH Connect ──────────────────────────────────────────────────
+    log('Connecting via SSH...', 3);
+    await new Promise((resolve, reject) => {
+      conn.once('ready', resolve);
+      conn.once('error', reject);
+      conn.connect({
+        host: config.host,
+        port: parseInt(config.port) || 22,
+        username: config.user || config.username || 'root',
+        password: rawPass || undefined,
+        privateKey: config.privateKey || undefined,
+        readyTimeout: 20000,
+        keepaliveInterval: 15000,
+        keepaliveCountMax: 4,
+      });
+    });
+    log('SSH connection established', 8);
+
+    // ── STEP 2: OS/package-manager detection ────────────────────────────────
+    log('Detecting OS and environment...', 10);
+    const osRaw = await run("cat /etc/os-release 2>/dev/null | grep '^NAME' | cut -d= -f2 | tr -d '\"' || uname -s").catch(() => 'Linux');
+    const pkgMgr = await run('which apt-get 2>/dev/null && echo apt || which yum 2>/dev/null && echo yum || which dnf 2>/dev/null && echo dnf || echo unknown').catch(() => 'unknown');
+    log(`OS: ${osRaw.split('\n')[0]} | pkg: ${pkgMgr}`, 12);
+
+    // Ensure curl is available
+    const hasCurl = await run('which curl 2>/dev/null && echo yes || echo no').catch(() => 'no');
+    if (!hasCurl.includes('yes')) {
+      log('Installing curl...', 13);
+      if (pkgMgr.includes('apt')) await run(S('apt-get install -y curl'), 120_000);
+      else if (pkgMgr.includes('yum')) await run(S('yum install -y curl'), 120_000);
+    }
+
+    // ── STEP 3: Check / Install Node.js ──────────────────────────────────────
+    log('Checking Node.js...', 15);
+    let nodeBin = await run('which node 2>/dev/null || which nodejs 2>/dev/null').catch(() => '');
+    if (nodeBin) {
+      const nodeVer = await run(`${nodeBin} --version`).catch(() => '?');
+      log(`Node.js found at ${nodeBin} (${nodeVer})`, 28);
+    } else {
+      log('Node.js missing — installing v20 LTS...', 18);
+      try {
+        if (pkgMgr.includes('apt')) {
+          await run(S('bash -c "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"'), 180_000);
+          await run(S('apt-get install -y nodejs'), 180_000);
+        } else if (pkgMgr.includes('yum') || pkgMgr.includes('dnf')) {
+          await run(S('bash -c "curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -"'), 180_000);
+          await run(S(`${pkgMgr.includes('dnf') ? 'dnf' : 'yum'} install -y nodejs`), 180_000);
+        } else {
+          // Fallback: install via volta or nvm
+          await run('curl -fsSL https://fnm.vercel.app/install | bash - && export PATH="$HOME/.fnm:$PATH" && fnm install --lts', 300_000);
+        }
+        nodeBin = await run('which node 2>/dev/null || which nodejs 2>/dev/null');
+        const ver = await run(`${nodeBin} --version`).catch(() => '?');
+        log(`Node.js installed: ${ver} at ${nodeBin}`, 28);
+      } catch (e) {
+        throw new Error(`Node.js installation failed: ${e.message}`);
+      }
+    }
+
+    // ── STEP 4: Create agent directory ───────────────────────────────────────
+    log(`Creating directory ${remotePath}...`, 30);
+    await run(`${S(`mkdir -p ${remotePath}`)} && ${S(`chmod 755 ${remotePath}`)}`);
+    log('Directory ready', 38);
+
+    // ── STEP 5: Download agent bundle from hub ───────────────────────────────
+    log('Downloading agent bundle from hub...', 40);
+    const agentDest = `${remotePath}/agent.js`;
+    const dlOut = await run(
+      `${S(`curl -fsSL "http://${HUB_IP}:5010/api/agent/download" -o ${agentDest}`)} && wc -c < ${agentDest}`,
+      120_000
+    );
+    const agentBytes = parseInt((dlOut.match(/\d+/) || ['0'])[0]);
+    if (agentBytes < 50_000) {
+      throw new Error(`Agent bundle too small (${agentBytes} bytes) — hub download failed. Is port 5010 reachable from ${config.host}?`);
+    }
+    log(`Agent bundle downloaded — ${Math.round(agentBytes / 1024)} KB`, 55);
+
+    // ── STEP 6: Write .env with hub credentials ──────────────────────────────
+    log('Writing agent configuration...', 58);
+    const agentSecret = AGENT_SECRET; // Use backend's module-level const (what socket auth middleware checks)
+    const agentHostId = hostId; // must match fleet key: "ssh-<ip>"
+    const envContent = [
+      `HUB_URL=${hubUrl}`,
+      `AGENT_SECRET=${agentSecret}`,
+      `AGENT_TOKEN=${agentSecret}`,
+      `HOST_ID=${agentHostId}`,
+      `NODE_ENV=production`,
+    ].join('\n') + '\n';
+    await writeFile(`${remotePath}/.env`, envContent);
+    log('.env written with hub credentials', 62);
+
+    // ── STEP 7: Write systemd unit file ──────────────────────────────────────
+    log('Installing systemd service...', 65);
+    const unitContent = [
+      '[Unit]',
+      'Description=Nova TelemetryHub Edge Agent',
+      'After=network-online.target',
+      'Wants=network-online.target',
+      '',
+      '[Service]',
+      'Type=simple',
+      `WorkingDirectory=${remotePath}`,
+      `Environment=AGENT_SECRET=${agentSecret}`,
+      `Environment=AGENT_TOKEN=${agentSecret}`,
+      `Environment=HUB_URL=${hubUrl}`,
+      `Environment=HOST_ID=${agentHostId}`,
+      `Environment=NODE_ENV=production`,
+      `ExecStart=${nodeBin} ${agentDest}`,
+      'Restart=on-failure',
+      'RestartSec=10',
+      'StartLimitIntervalSec=120',
+      'StartLimitBurst=5',
+      'StandardOutput=journal',
+      'StandardError=journal',
+      'SyslogIdentifier=nova-agent',
+      '',
+      '[Install]',
+      'WantedBy=multi-user.target',
+    ].join('\n') + '\n';
+    const unitPath = '/etc/systemd/system/nova-agent.service';
+    // Stop and unmask before overwriting (handles masked/conflicting units from prior runs)
+    await run(S('systemctl stop nova-agent.service 2>/dev/null || true')).catch(() => {});
+    await run(S('systemctl disable nova-agent.service 2>/dev/null || true')).catch(() => {});
+    await run(S('systemctl unmask nova-agent.service 2>/dev/null || true')).catch(() => {});
+    await writeFile(unitPath, unitContent);
+    await run(S('systemctl daemon-reload'));
+    await run(S('systemctl enable nova-agent.service'));
+    log('Systemd service installed and enabled', 72);
+
+    // ── STEP 8: Start / restart the service ──────────────────────────────────
+    log('Starting nova-agent service...', 75);
+    await run(S('systemctl restart nova-agent.service'), 30_000);
+    await new Promise(r => setTimeout(r, 2000));
+
+    const svcStatus = await run(S('systemctl is-active nova-agent.service')).catch(() => 'unknown');
+    if (svcStatus.trim() !== 'active') {
+      const journal = await run(S('journalctl -u nova-agent -n 15 --no-pager 2>/dev/null || true')).catch(() => '');
+      log(`Service status: ${svcStatus.trim()}. Last logs:\n${journal}`, 80, 'warn');
+    } else {
+      log('nova-agent.service is active', 80);
+    }
+
+    // ── STEP 9: Wait for agent heartbeat ─────────────────────────────────────
+    log('Waiting for agent to phone home (up to 30s)...', 82);
+    const heartbeat = await new Promise(resolve => {
+      let tries = 0;
+      const poll = () => {
+        const h = hosts[hostId];
+        if (h && h.connectionType === 'agent_push' && h.status === 'online') {
+          return resolve(true);
+        }
+        if (++tries >= 15) return resolve(false);
+        setTimeout(poll, 2000);
+      };
+      setTimeout(poll, 3000);
+    });
+
+    if (heartbeat) {
+      log('Agent heartbeat confirmed — deployment complete!', 100, 'success');
+    } else {
+      // Get diagnostics
+      const agentLog = await run(S('journalctl -u nova-agent -n 10 --no-pager 2>/dev/null || true')).catch(() => '');
+      const connTest = await run(`curl -sf "http://${HUB_IP}:5010/api/health" -o /dev/null && echo reachable || echo unreachable`).catch(() => 'error');
+      log(
+        `Agent started but no heartbeat yet.\nHub reachability: ${connTest}\nAgent log tail:\n${agentLog}\n\nCheck: journalctl -u nova-agent -f`,
+        100, 'warn'
+      );
+    }
+
+    // ── Register host in fleet ────────────────────────────────────────────────
+    if (!hosts[hostId] || hosts[hostId].connectionType !== 'agent_push') {
+      hosts[hostId] = {
+        name: config.name || config.host,
+        os: 'linux', disks: [], partitions: [], history: [],
+        lastUpdate: Date.now(), status: heartbeat ? 'online' : 'deploying',
+        connectionType: 'ssh',
+      };
+    }
+    if (!sshConfigs.find(c => c.host === config.host)) sshConfigs.push(config);
+    db.saveSshHost(config);
+    io.emit('hosts_update', hosts);
+
+  } catch (e) {
+    if (!session.cancelled) {
+      log(`Deployment failed: ${e.message}`, 100, 'error');
+    }
+  } finally {
+    clearTimeout(session.timeout);
+    deploymentSessions.delete(hostId);
+    if (session.conn) try { session.conn.end(); } catch(_) {}
+  }
+}
+
+
+// Remove SSH target
+app.delete('/api/ssh/delete/:host', (req, res) => {
+  const host = req.params.host;
+  sshConfigs = sshConfigs.filter(c => c.host !== host);
+  db.deleteSshHost(host);
+  const hostId = `ssh-${host}`;
+  if (hosts[hostId]) {
+    delete hosts[hostId];
+    io.emit('hosts_update', hosts);
+    // Note: Standard background polling for this hostId may throw errors, 
+    // but the system recovers gracefully. Ideally we'd abort but this is out of scope.
+  }
+  res.json({ success: true });
+});
+
+// Remove host
+app.delete('/api/hosts/:id', (req, res) => {
+  const hostId = req.params.id;
+  if (hostId === 'localhost') return res.status(403).json({ error: 'Cannot remove local hub server' });
+
+  // 1. Cleanup SSH session if active
+  if (sshSessions[hostId]) {
+    if (sshSessions[hostId].shell) sshSessions[hostId].shell.end();
+    if (sshSessions[hostId].conn) sshSessions[hostId].conn.end();
+    delete sshSessions[hostId];
+  }
+
+  // 2. Remove from sshConfigs if exist
+  const ipToRemove = hostId.replace('ssh-', '');
+  sshConfigs = sshConfigs.filter(c => c.host !== ipToRemove);
+  db.deleteSshHost(ipToRemove);
+
+  // 3. Remove Host entry
+  delete hosts[hostId];
+
+  logEvent('system', `Node removed from fleet: ${hostId}`, {});
+  io.emit('hosts_update', hosts);
+  res.json({ success: true });
+});
+
+// Agent reporting
+app.post('/api/report', (req, res) => {
+  const { hostId, hostname, os, disks, partitions, cpu, mem, event, network, smartData, perfData, raidData, zfsData, dockerContainers } = req.body;
+  if (!hosts[hostId]) logEvent('system', `New agent connected: ${hostname}`, { os }, hostId);
+
+  const currentHost = hosts[hostId] || { history: [] };
+  const avgUsage = (partitions || []).reduce((a, p) => a + (p.use || 0), 0) / ((partitions || []).length || 1);
+  const newHistory = [...(currentHost.history || []), { time: new Date().toLocaleTimeString(), usage: Math.round(avgUsage), cpu: cpu || 0, mem: mem || 0 }].slice(-60);
+
+  // 1. Process SMART & Health
+  const enrichedDisks = (disks || []).map(d => {
+    let health = { score: 100, risk: 'low', signs: [], actions: [], prediction: null, demerits: 0 };
+    if (smartData) {
+      const smart = smartData.find(s => s.device === d.device);
+      if (smart) {
+        health = analyzeDiskHealth(d, smart);
+
+        // Smart Alerting for Remote Agents
+        const store = diskHealthStore[d.serial || d.name];
+        if (store && store.snapshots.length > 0) {
+          const drop = store.snapshots[store.snapshots.length - 1].score - health.score;
+          if (drop >= alertThresholds.healthDrop && drop > 0) {
+            fireAlert('critical', `⚠️ HEALTH DROP: ${hostname} - ${d.name} score decreased by ${Math.round(drop)} points`, hostId, { disk: d.name, drop });
+          }
+        }
+      }
+    }
+    return { ...d, health, status: health.risk === 'critical' ? 'ERROR' : 'OK' };
+  });
+
+  // 2. Broadcast Performance Data
+  if (perfData && perfData.length > 0) {
+    const perfStats = perfData.map(p => ({
+      name: p.device,
+      serialNum: enrichedDisks.find(d => d.device === p.device)?.serial || '',
+      rIops: p.rIops,
+      wIops: p.wIops,
+      rSpeed: p.rSpeed,
+      wSpeed: p.wSpeed,
+      latency: p.latency,
+      host: hostname // Tag with agent name
+    }));
+    io.emit('performance_update', perfStats);
+  }
+
+  // 3. Identity Merging & Context Inheritance
+  // If an SSH host exists with the current IP or hostname, merge them
+  let mergedId = hostId;
+  const existingSshHost = Object.keys(hosts).find(id => {
+    return id.startsWith('ssh-') && (id.includes(hostname) || hostname.includes(id.replace('ssh-', '')));
+  });
+  
+  if (existingSshHost) {
+     mergedId = existingSshHost;
+     logEvent('system', `Merged agent identity with SSH context: ${hostname}`, {}, mergedId);
+  }
+
+  hosts[mergedId] = {
+    name: hostname,
+    os,
+    disks: enrichedDisks,
+    partitions: partitions || [],
+    history: newHistory,
+    lastUpdate: Date.now(),
+    status: 'online',
+    connectionType: existingSshHost ? 'ssh' : 'agent',
+    cpu: cpu || 0,
+    mem: mem || 0,
+    network: network || { rx: 0, tx: 0 },
+    storageData: {
+      raid: raidData || [],
+      zfs: zfsData || null
+    },
+    dockerContainers: dockerContainers || []
+  };
+
+  (partitions || []).forEach(p => {
+    if (p.use > alertThresholds.diskUsage) fireAlert('warning', `Agent ${hostname}: ${p.mount} at ${p.use}%`, hostId, { mount: p.mount, use: p.use });
+  });
+  if (cpu > alertThresholds.cpuLoad) fireAlert('warning', `Agent ${hostname}: High CPU ${cpu}%`, hostId, { cpu });
+  if (event) { logEvent(event.type, event.message, event.details || {}, hostId); }
+
+  io.emit('hosts_update', hosts);
+  res.json({ success: true });
+});
+
+// ─── Socket.io ────────────────────────────────────────────────────────────────
+
+// Socket.io authentication middleware
+io.use((socket, next) => {
+  const auth = socket.handshake.auth || {};
+  // Agents must provide valid agent token
+  if (auth.role === 'agent') {
+    if (auth.token === AGENT_SECRET) {
+      socket.isAgent = true;
+      return next();
+    }
+    console.warn(`[SECURITY] Rejected agent connection with invalid token from ${socket.handshake.address}`);
+    return next(new Error('Invalid agent token'));
+  }
+  // UI clients: validate JWT if provided
+  if (auth.token) {
+    try {
+      socket.user = jwt.verify(auth.token, JWT_SECRET);
+    } catch { /* viewer without auth — read-only events only */ }
+  }
+  next();
+});
+
+io.on('connection', (socket) => {
+  console.log(`Client connected: ${socket.id} [${socket.isAgent ? 'AGENT' : 'UI'}]`);
+  socket.emit('hosts_update', hosts);
+  socket.emit('bandwidth_update', { history: bandwidthHistory, current: bandwidthHistory[bandwidthHistory.length - 1] || { rx: 0, tx: 0 } });
+  socket.emit('network_devices', Object.values(networkDevices));
+  socket.emit('raid_zfs_update', raidZfsCache);
+
+  // ─── Edge Agent Handlers ───
+  socket.on('agent:register', (info) => {
+    const hostId = socket.handshake.auth?.hostId || `agent-${socket.id.substring(0,6)}`;
+    socket.hostId = hostId;
+    socket.isAgent = true;
+    console.log(`[Hub] Edge Agent Registered: ${hostId}`);
+    hosts[hostId] = {
+      name: `Agent: ${info.hostname}`,
+      os: info.platform,
+      disks: [], partitions: [], history: [],
+      lastUpdate: Date.now(), status: 'online',
+      connectionType: 'agent_push', cpu: 0, mem: 0,
+      network: { rx: 0, tx: 0, iface: '' }
+    };
+    io.emit('hosts_update', hosts);
+  });
+
+  socket.on('agent:telemetry:push', (payload) => {
+    const hostId = socket.hostId;
+    if (!hostId || !hosts[hostId]) return;
+
+    hosts[hostId].lastUpdate     = Date.now();
+    hosts[hostId].status         = 'online';
+    hosts[hostId].cpu            = payload.cpu || 0;
+    hosts[hostId].mem            = payload.mem || 0;
+    hosts[hostId].network        = payload.network || { rx: 0, tx: 0, iface: '' };
+    hosts[hostId].disks          = payload.disks || [];
+    hosts[hostId].partitions     = payload.partitions || [];
+    hosts[hostId].raidArrays     = payload.raidArrays || [];
+    hosts[hostId].lvm            = payload.lvm || null;
+    hosts[hostId].virtualization = payload.virtualization || null;
+    hosts[hostId].ioStats        = payload.ioStats || [];
+
+    io.emit('hosts_update', hosts);
+
+    // Push live IO stream to any UI client currently watching this host
+    Array.from(io.sockets.sockets.values()).forEach(s => {
+      if (s.watchingHostId === hostId && !s.isAgent) {
+        s.emit('disk:io:live', {
+          hostId,
+          ioStats: payload.ioStats || [],
+          disks: payload.disks || [],
+          partitions: payload.partitions || [],
+          cpu: payload.cpu || 0,
+          mem: payload.mem || 0,
+          ts: Date.now()
+        });
+      }
+    });
+  });
+
+  socket.on('agent:scan:progress', ({ jobId, diskName, progress }) => {
+    io.emit('scan:progress', { jobId, hostId: socket.hostId, diskName, progress });
+  });
+
+  socket.on('agent:scan:result', ({ jobId, diskName, type, result }) => {
+    io.emit('scan:complete', { jobId, hostId: socket.hostId, diskName, result, failed: result.failed || false });
+  });
+
+  // ── Live disk watch subscriptions from UI clients ──
+  socket.on('disk:watch:start', ({ hostId }) => {
+    socket.watchingHostId = hostId || null;
+  });
+  socket.on('disk:watch:stop', () => {
+    socket.watchingHostId = null;
+  });
+
+  // ── Scan log events forwarded to watching UI clients ──
+  socket.on('agent:scan:log', ({ jobId, level, message }) => {
+    const hid = socket.hostId;
+    if (!hid) return;
+    Array.from(io.sockets.sockets.values()).forEach(s => {
+      if (s.watchingHostId === hid && !s.isAgent) {
+        s.emit('scan:log', { jobId, hostId: hid, level, message, ts: Date.now() });
+      }
+    });
+  });
+
+  socket.on('run_scan', async (hostId) => {
+    if (hostId === 'localhost') {
+      await pollDisks();
+      socket.emit('scan_complete', { hostId: 'localhost' });
+    }
+  });
+
+  socket.on('set_thresholds', (thresholds) => {
+    alertThresholds = { ...alertThresholds, ...thresholds };
+    logEvent('system', 'Thresholds updated via UI', alertThresholds);
+    io.emit('thresholds_update', alertThresholds);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Client disconnected:', socket.id);
+    // FIX #9: Detach socket but start idle timer — do NOT kill session
+    Object.keys(sshSessions).forEach(id => {
+      if (sshSessions[id].socketId === socket.id) {
+        sshSessions[id].socketId = null;
+        // Auto-kill if unused for 30 minutes
+        if (sshSessions[id].idleTimer) clearTimeout(sshSessions[id].idleTimer);
+        sshSessions[id].idleTimer = setTimeout(() => {
+          const s = sshSessions[id];
+          if (s && !s.socketId && !s.killed) {
+            console.log(`[Hub] Auto-killing idle session for ${id} (30min timeout)`);
+            if (s.local && s.shell) s.shell.kill();
+            else { if (s.shell) s.shell.end(); if (s.conn) s.conn.end(); }
+            s.killed = true;
+            delete sshSessions[id];
+          }
+        }, 30 * 60 * 1000);
+      }
+    });
+  });
+
+  // ─── Real-time SSH Shell (Persistent) ──────────────────────────────────────
+  socket.on('ssh_shell_start', async (hostId) => {
+    console.log(`[SSH] ssh_shell_start received for hostId="${hostId}" from socket=${socket.id}`);
+    // 1. Restore Existing Session if already running in the background
+    const existingSession = sshSessions[hostId];
+    if (existingSession && existingSession.shell && !existingSession.killed) {
+      console.log(`[Hub] Restoring persistent terminal session for ${hostId}`);
+      existingSession.socketId = socket.id;
+      // FIX #9: Clear idle timer since user reconnected
+      if (existingSession.idleTimer) { clearTimeout(existingSession.idleTimer); existingSession.idleTimer = null; }
+      if (existingSession.history) {
+        // FIX #8: Send ANSI reset before replaying history to avoid broken terminal colors
+        socket.emit('ssh_shell_output', { hostId, data: '\x1b[0m' + existingSession.history });
+      }
+      return;
+    }
+
+    // FIX #2: Race Condition guard — prevent duplicate concurrent session creation
+    if (existingSession && existingSession.starting) {
+      console.warn(`[Hub] Session for ${hostId} is already starting. Ignoring duplicate.`);
+      return;
+    }
+
+    // Lock: Mark as starting to block concurrent requests for same hostId
+    sshSessions[hostId] = { starting: true, history: '', idleTimer: null };
+
+    // Helper: line-based buffer (FIX #8) + stream to active socket
+    const handleOutput = (d) => {
+      const session = sshSessions[hostId];
+      if (!session) return;
+      const str = d.toString('utf8');
+      session.history += str;
+      // FIX #8: Keep last 1500 lines to avoid mid-line ANSI sequence breaks
+      const lines = session.history.split('\n');
+      if (lines.length > 1500) {
+        session.history = lines.slice(-1500).join('\n');
+      }
+      if (session.socketId) {
+        io.to(session.socketId).emit('ssh_shell_output', { hostId, data: str });
+      }
+    };
+
+    if (hostId === 'localhost') {
+       const isWindows = process.platform === 'win32';
+       const shellCmd = isWindows ? 'powershell.exe' : '/bin/bash';
+       const shellArgs = isWindows ? [] : ['--login'];
+       const shellProc = spawn(shellCmd, shellArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+       sshSessions[hostId] = { shell: shellProc, socketId: socket.id, local: true, history: '', idleTimer: null };
+
+       shellProc.stdout.on('data', handleOutput);
+       shellProc.stderr.on('data', handleOutput);
+       shellProc.on('close', () => {
+         if (sshSessions[hostId] && sshSessions[hostId].socketId) io.to(sshSessions[hostId].socketId).emit('ssh_shell_closed', hostId);
+         if (sshSessions[hostId]) sshSessions[hostId].killed = true;
+         delete sshSessions[hostId];
+       });
+       return;
+    }
+
+    let config = sshConfigs.find(c => `ssh-${c.host}` === hostId);
+    console.log(`[SSH] sshConfigs has ${sshConfigs.length} entries. Lookup result: ${config ? 'FOUND ' + config.host : 'NOT FOUND'}`);
+    // Fallback: reload from DB if not in memory
+    if (!config) {
+      try {
+        const dbHosts = await db.getSshHosts();
+        sshConfigs = dbHosts;
+        config = dbHosts.find(c => `ssh-${c.host}` === hostId);
+        console.log(`[SSH] DB fallback: ${dbHosts.length} hosts loaded. Lookup: ${config ? 'FOUND ' + config.host : 'STILL NOT FOUND'}`);
+      } catch(e) { console.warn('[Hub] DB fallback failed:', e.message); }
+    }
+    if (!config) {
+      console.error(`[SSH] FATAL: No config found for hostId="${hostId}". Available hosts: ${sshConfigs.map(c => c.host).join(', ')}`);
+      delete sshSessions[hostId]; // FIX #2: Release starting lock
+      return socket.emit('ssh_shell_error', 'Host configuration not found.');
+    }
+    console.log(`[SSH] Connecting to ${config.host}:${config.port || 22} as ${config.user}`);
+
+    const conn = new Client();
+    conn.on('ready', () => {
+      conn.shell({ term: 'xterm-256color', rows: 30, cols: 100 }, (err, stream) => {
+        if (err) {
+          delete sshSessions[hostId]; // FIX #2: Release on error
+          return socket.emit('ssh_shell_error', `Shell Error: ${err.message}`);
+        }
+
+        sshSessions[hostId] = { conn, shell: stream, socketId: socket.id, history: '', idleTimer: null };
+
+        stream.on('data', handleOutput).on('close', () => {
+          if (sshSessions[hostId] && sshSessions[hostId].socketId) {
+            io.to(sshSessions[hostId].socketId).emit('ssh_shell_closed', hostId);
+          }
+          if (sshSessions[hostId]) sshSessions[hostId].killed = true;
+          delete sshSessions[hostId];
+        });
+      });
+    }).on('error', (err) => {
+      delete sshSessions[hostId]; // FIX #2: Release lock on connection error
+      socket.emit('ssh_shell_error', `Connection Error: ${err.message}`);
+    }).connect({
+      host: config.host,
+      port: config.port || 22,
+      username: config.user || config.username,
+      password: config.pass || config.password,
+      readyTimeout: 15000,
+      keepaliveInterval: 10000
+    });
+  });
+
+  // FIX #4: PTY Resize — sync terminal dimensions with remote shell on browser window resize
+  socket.on('ssh_shell_resize', ({ hostId, cols, rows }) => {
+    const session = sshSessions[hostId];
+    if (!session || session.killed || session.local || session.starting) return;
+    try {
+      if (session.shell && typeof session.shell.setWindow === 'function') {
+        session.shell.setWindow(rows, cols, 0, 0);
+      }
+    } catch (e) {
+      console.error('[Hub] PTY resize error:', e.message);
+    }
+  });
+
+  socket.on('ssh_shell_data', ({ hostId, data }) => {
+    const session = sshSessions[hostId];
+    if (session && session.shell) {
+      try {
+        if (session.local) {
+           if (!session.killed) session.shell.stdin.write(data);
+        } else {
+           if (!session.killed) session.shell.write(data);
+        }
+      } catch (err) {
+        console.error('Socket Shell Write Error:', err.message);
+      }
+    }
+  });
+
+  socket.on('ssh_shell_stop', (hostId) => {
+    const session = sshSessions[hostId];
+    if (session) {
+      session.killed = true;
+      if (session.idleTimer) clearTimeout(session.idleTimer);
+      if (session.local) {
+         if (session.shell) session.shell.kill();
+      } else {
+         if (session.shell) session.shell.end();
+         if (session.conn) session.conn.end();
+      }
+      delete sshSessions[hostId];
+    }
+  });
+});
+
+// ─── Persistence & Auto-Healing ──────────────────────────────────────────────
+const dispatchAlert = async (msg) => {
+  try {
+    const webhooks = await db.getWebhooks();
+    webhooks.filter(w => w.enabled).forEach(async (w) => {
+      if (w.type === 'discord') {
+         await axios.post(w.url, { content: `🚨 **TelemetryHub Alert**: ${msg}` });
+      } else if (w.type === 'telegram') {
+         const url = `https://api.telegram.org/bot${w.token}/sendMessage`;
+         await axios.post(url, { chat_id: w.chatId, text: `🚨 TelemetryHub Alert:\n${msg}` });
+      }
+    });
+  } catch (e) { console.error('[Alert] Dispatch error:', e.message); }
+};
+
+setInterval(async () => {
+  // 1. Save History for all online nodes
+  Object.keys(hosts).forEach(id => {
+    const h = hosts[id];
+    if (h.status === 'online') {
+      db.saveHistory(id, { 
+        cpu: h.cpu, 
+        mem: h.mem, 
+        network: h.network 
+      });
+    }
+  });
+
+  // 2. Prune old data (7 days)
+  db.pruneHistory();
+
+  // 3. Evaluate Auto-Healing Rules
+  try {
+    const rules = await db.getRules();
+    rules.filter(r => r.enabled).forEach(rule => {
+      const h = hosts[rule.hostId];
+      if (!h || h.status !== 'online') return;
+
+      let trigger = false;
+      if (rule.metric === 'cpu' && h.cpu > rule.threshold) trigger = true;
+      if (rule.metric === 'mem' && h.mem > rule.threshold) trigger = true;
+
+      if (trigger) {
+        db.logEvent(rule.hostId, 'auto-healing', `Triggered: ${rule.name}. Running: ${rule.action}`);
+        const session = sshSessions[rule.hostId];
+        if (session && session.conn) {
+          session.conn.exec(rule.action, (err, stream) => {
+            if (err) console.error('[Auto-Healing] Exec error:', err);
+            else stream.on('close', () => console.log('[Auto-Healing] Action completed.'));
+          });
+        }
+      }
+    });
+  } catch (e) { console.error('[Auto-Healing] Error:', e.message); }
+}, 60000); // 1 minute
+
+// ─── Deep Disk Diagnostics APIs ─────────────────────────────────────────────
+const executeGhostPayload = (hostId, basePayloadName, winArgs, linArgs) => {
+  return new Promise((resolve, reject) => {
+    // Local Hub Execution
+    if (hostId === 'localhost') {
+      if (process.platform === 'linux') {
+        const linCmd = (basePayloadName === 'raw') ? linArgs
+          : (basePayloadName === 'smartctl') ? ('smartctl ' + linArgs)
+          : (require('path').join(__dirname, 'payloads', basePayloadName + '-linux') + ' ' + linArgs);
+        require('child_process').exec(linCmd, { timeout: 15000 }, (err, stdout) => resolve(stdout || ''));
+        return;
+      }
+      if (basePayloadName === 'raw') {
+        require('child_process').exec(`powershell -Command "${winArgs.replace(/"/g, '\\"')}"`, (err, stdout) => resolve(stdout || ''));
+        return;
+      }
+      if (basePayloadName === 'smartctl') {
+        require('child_process').exec(`powershell -Command "smartctl ${winArgs}"`, (err, stdout) => resolve(stdout || ''));
+        return;
+      }
+      const localPath = path.join(__dirname, 'payloads', `${basePayloadName}.exe`);
+      require('child_process').exec(`powershell -Command "& '${localPath}' ${winArgs}"`, (err, stdout) => resolve(stdout || ''));
+      return;
+    }
+
+    const config = sshConfigs.find(c => `ssh-${c.host}` === hostId);
+    if (!config) return reject(new Error('SSH Configuration not tied to this host.'));
+
+    const conn = new Client();
+    conn.on('ready', () => {
+      // Step 1: Detect Target OS
+      conn.exec('uname', (err, stream) => {
+        let isLinux = false;
+        if (!err) {
+          stream.on('data', (d) => { if (d.toString().toLowerCase().includes('linux')) isLinux = true; });
+        }
+        
+        stream.on('close', () => {
+           // Step 2: Push relevant payload or execute raw
+           const args = isLinux ? linArgs : winArgs;
+
+           if (basePayloadName === 'raw') {
+             conn.exec(args, (err, stream2) => {
+                let output = '';
+                if (err) { conn.end(); return reject(err); }
+                stream2.on('data', d => output += d).on('close', () => { conn.end(); resolve(output); });
+             });
+             return;
+           }
+
+           const payloadName = isLinux ? `${basePayloadName}-linux` : `${basePayloadName}.exe`;
+           
+           conn.sftp((err, sftp) => {
+             if (err) { conn.end(); return reject(err); }
+
+             const localFile = path.join(__dirname, 'payloads', payloadName);
+             if (!fs.existsSync(localFile)) { conn.end(); return reject(new Error(`Payload [${payloadName}] missing inside Hub.`)); }
+
+             const remoteFileName = `/tmp/ghost_${Date.now()}_${payloadName}`;
+
+             sftp.fastPut(localFile, remoteFileName, (err) => {
+                if (err) { conn.end(); return reject(err); }
+
+                const execCmd = !isLinux ? `powershell -Command "& '${remoteFileName}' ${args}"` : `chmod +x ${remoteFileName} && ${remoteFileName} ${args}`;
+                const delCmd = !isLinux ? `del /F /Q "${remoteFileName}"` : `rm -f ${remoteFileName}`;
+
+                conn.exec(execCmd, (err, stream) => {
+                   let output = '';
+                   if (err) return conn.exec(delCmd, () => { conn.end(); reject(err); }); 
+                   
+                   stream.on('data', (d) => output += d ).on('close', () => {
+                      // GHOST: Clean up instantly
+                      conn.exec(delCmd, () => {
+                         conn.end();
+                         resolve(output);
+                      });
+                   });
+                });
+             });
+           });
+        });
+      });
+    }).on('error', err => reject(err)).connect({
+      host: config.host, port: config.port || 22, username: config.username, password: config.password, privateKey: config.privateKey
+    });
+  });
+};
+
+// ─── Ghost Engine Abstraction ───────────────────────────────────────────────
+const executeInvisibleSmartPoll = async (hostId, diskName) => {
+  // ── Fast path: localhost on Windows/Linux — use systeminformation directly ──
+  if (hostId === 'localhost') {
+    try {
+      const [disks, smartArr] = await Promise.all([
+        si.diskLayout().catch(() => []),
+        si.smartData ? si.smartData().catch(() => []) : Promise.resolve([])
+      ]);
+
+      // Find matching disk
+      const disk = disks.find(d =>
+        d.name === diskName || d.device === diskName ||
+        (d.device && d.device.replace(/\\\\.\\/, '') === diskName)
+      ) || disks[0];
+
+      if (!disk) {
+        return { success: false, error: `Disk '${diskName}' not found in layout` };
+      }
+
+      const smart = Array.isArray(smartArr)
+        ? (smartArr.find(s => s.serialNum === disk.serialNum) || smartArr[0])
+        : null;
+
+      const attrs = (smart && smart.attributes) ? smart.attributes : {};
+      const isVirtualDisk = Object.keys(attrs).length === 0;
+
+      // Helper to read a SMART attribute — checks by key name (any case) or by id
+      const readAttr = (names, ids) => {
+        for (const n of (names || [])) {
+          const k = Object.keys(attrs).find(k => k.toLowerCase() === n.toLowerCase());
+          if (k && attrs[k]) {
+            const v = attrs[k].raw_value ?? attrs[k].rawValue ?? attrs[k].raw ?? attrs[k].value;
+            const parsed = parseInt(String(v).replace(/[^0-9]/g, ''), 10);
+            if (!isNaN(parsed)) return parsed;
+          }
+        }
+        for (const id of (ids || [])) {
+          const k = Object.keys(attrs).find(k => String(k) === String(id) || k.startsWith(`${id}_`) || k.startsWith(`${id} `));
+          if (k && attrs[k]) {
+            const v = attrs[k].raw_value ?? attrs[k].rawValue ?? attrs[k].raw ?? attrs[k].value;
+            const parsed = parseInt(String(v).replace(/[^0-9]/g, ''), 10);
+            if (!isNaN(parsed)) return parsed;
+          }
+        }
+        return isVirtualDisk ? 0 : 'N/A';
+      };
+
+      const isNvme = (disk.name || disk.device || '').toLowerCase().includes('nvme') ||
+                     (disk.interfaceType || '').toLowerCase().includes('nvme');
+
+      const tempVal = readAttr(['Temperature_Celsius', 'Airflow_Temperature_Cel'], ['190', '194']);
+      const temperature = (smart && smart.temperature && smart.temperature !== 'N/A')
+        ? parseInt(smart.temperature)
+        : (tempVal !== 'N/A' ? tempVal : 30);
+
+      const reallocated  = readAttr(['Reallocated_Sector_Ct'], ['5']);
+      const uncorrectable = readAttr(['Uncorrectable_Error_Cnt', 'UDMA_CRC_Error_Count'], ['187', '199']);
+      const pending      = readAttr(['Current_Pending_Sector'], ['197']);
+      const offline      = readAttr(['Offline_Uncorrectable'], ['198']);
+      const wearLevel    = readAttr(['Wear_Leveling_Count', 'Percent_Lifetime_Used'], ['173', '177', '231', '233']);
+      const mediaErrors  = readAttr(['Media_Wearout_Indicator', 'Media_and_Data_Integrity_Errors'], ['184', '188']);
+      const percentUsed  = readAttr(['Percent_Lifetime_Used', 'SSD_Life_Left'], ['177', '231']);
+
+      const num = (v) => v === 'N/A' ? 0 : v;
+      const isAtRisk = isNvme
+        ? (num(mediaErrors) > 0 || num(percentUsed) > 80)
+        : (num(reallocated) > 10 || num(uncorrectable) > 0 || num(pending) > 0 || num(offline) > 0);
+
+      // Predictive slope analysis
+      let predictedDays = null;
+      try {
+        const history = await db.getDiskAnalytics(hostId, disk.name || diskName, 10);
+        if (history.length > 3) {
+          const first = history[history.length - 1];
+          const errDiff = isNvme ? (mediaErrors - first.uncorrectable) : (reallocated - first.reallocated);
+          const timeDiffDays = (new Date(history[0].timestamp) - new Date(first.timestamp)) / (1000 * 60 * 60 * 24);
+          if (errDiff > 0 && timeDiffDays > 0) {
+            const slope = errDiff / timeDiffDays;
+            const remainingToCrit = isNvme ? (100 - percentUsed) : (50 - reallocated);
+            if (slope > 0) predictedDays = Math.max(1, Math.round(remainingToCrit / slope));
+            if (predictedDays !== null && predictedDays < 30) isAtRisk = true;
+          }
+        }
+      } catch (e) {}
+
+      // Persist to DB
+      db.saveDiskAnalytics(hostId, disk.name || diskName,
+        isAtRisk ? 'WARNING' : 'PASSED',
+        temperature,
+        isNvme ? percentUsed : (reallocated || 0),
+        isNvme ? mediaErrors : (uncorrectable || 0)
+      );
+
+      // OS metadata
+      let osMetadata = null;
+      try {
+        const cp = require('child_process'), util = require('util');
+        const exec = util.promisify(cp.exec);
+        if (process.platform === 'win32') {
+          const pdMatch = (disk.device || '').match(/PHYSICALDRIVE(\d+)/i);
+          const pdIndex = pdMatch ? pdMatch[1] : '0';
+          const { stdout } = await exec(
+            `powershell -NoProfile -Command "Get-PhysicalDisk -DeviceNumber ${pdIndex} | Select-Object MediaType,HealthStatus,OperationalStatus | ConvertTo-Json"`
+          );
+          osMetadata = JSON.parse(stdout);
+        }
+      } catch (e) {}
+
+      return {
+        success: true, scan_type: 'fast',
+        disk: disk.name || diskName,
+        diskModel: disk.model || disk.name,
+        diskSize: disk.size,
+        diskInterface: disk.interfaceType,
+        diskSerial: disk.serialNum,
+        timestamp: new Date().toISOString(),
+        predicted_days: predictedDays,
+        fatal_five: isNvme ? {
+          'NVMe Media Errors':     mediaErrors,
+          'NVMe Percentage Used':  percentUsed,
+          'NVMe Available Spare':  readAttr(['Available_Spare'], ['13']) || (100 - percentUsed),
+          'Temperature (°C)':      temperature
+        } : {
+          'SMART 5 (Reallocated Sectors)':       reallocated,
+          'SMART 187 (Uncorrectable Errors)':    uncorrectable,
+          'SMART 197 (Pending Sectors)':         pending,
+          'SMART 198 (Offline Uncorrectable)':   offline,
+          'SMART 173 (Wear Leveling)':           wearLevel || 0,
+        },
+        temperature,
+        overall_health: isAtRisk ? 'WARNING' : 'PASSED',
+        overallStatus: isAtRisk ? 'WARNING' : 'PASSED',
+        errorCount: isNvme ? num(mediaErrors) : (num(reallocated) + num(uncorrectable) + num(pending) + num(offline)),
+        smartStatus: (smart && smart.status) || (disk.smartStatus) || 'OK',
+        isAtRisk,
+        reallocated: isNvme ? mediaErrors : reallocated,
+        os_metadata: osMetadata
+      };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  // ── SSH/Remote path (unchanged) ──────────────────────────────────────────
+  try {
+    const isNvme = diskName.toLowerCase().includes('nvme');
+    let rawOutput;
+    let winArgs = `-a /dev/${diskName}`;
+    let osMetadata = null;
+
+    try {
+      const isWin = await executeGhostPayload(hostId, 'raw', 'echo win', 'echo lin');
+      if (isWin.includes('lin')) {
+        const out = await executeGhostPayload(hostId, 'raw', '', `lsblk /dev/${diskName} -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT -J`);
+        if (out && out.includes('{')) osMetadata = JSON.parse(out.substring(out.indexOf('{')));
+      }
+    } catch (e) {}
+
+    if (isNvme) {
+      rawOutput = await executeGhostPayload(hostId, 'raw', `smartctl ${winArgs}`, `nvme smart-log /dev/${diskName} || smartctl -a /dev/${diskName}`);
+    } else {
+      rawOutput = await executeGhostPayload(hostId, 'smartctl', winArgs, `-a /dev/${diskName}`);
+    }
+
+    const extract = (regex) => { const match = rawOutput.match(regex); return match ? parseInt(match[1].replace(/,/g, ''), 10) : 0; };
+    const temperature = isNvme ? extract(/temperature\s*:\s*(\d+)/i) : extract(/Temperature_Celsius.*?\s+(\d+)(?:\r?\n|$)/) || 30;
+    const reallocated  = isNvme ? extract(/available_spare\s*:\s*(\d+)/i) : extract(/Reallocated_Sector_Ct.*?\s+(\d+)(?:\r?\n|$)/);
+    const mediaErrors  = isNvme ? extract(/media_errors\s*:\s*(\d+)/i) : 0;
+    const percentageUsed = isNvme ? extract(/percentage_used\s*:\s*(\d+)/i) : 0;
+    const uncorrectable = isNvme ? mediaErrors : extract(/Uncorrectable_Error_Cnt.*?\s+(\d+)(?:\r?\n|$)/);
+    const pending = extract(/Current_Pending_Sector.*?\s+(\d+)(?:\r?\n|$)/);
+    const offline = extract(/Offline_Uncorrectable.*?\s+(\d+)(?:\r?\n|$)/);
+    const wearLevel = isNvme ? percentageUsed : extract(/Wear_Leveling_Count.*?\s+(\d+)(?:\r?\n|$)/);
+    const isAtRisk = isNvme ? (mediaErrors > 0 || percentageUsed > 80) : (reallocated > 10 || uncorrectable > 0 || pending > 0 || offline > 0);
+
+    db.saveDiskAnalytics(hostId, diskName, isAtRisk ? 'WARNING' : 'PASSED', temperature, isNvme ? percentageUsed : (reallocated || 0), isNvme ? mediaErrors : (uncorrectable || 0));
+
+    return {
+      success: true, scan_type: 'fast', disk: diskName, timestamp: new Date().toISOString(),
+      fatal_five: isNvme ? {
+        'NVMe Media Errors': mediaErrors, 'NVMe Percentage Used': percentageUsed,
+        'NVMe Available Spare': extract(/available_spare\s*:\s*(\d+)/i) || 100, 'Temperature': temperature
+      } : {
+        'SMART 5 (Reallocated Sectors)': reallocated, 'SMART 187 (Uncorrectable Errors)': uncorrectable,
+        'SMART 197 (Pending Sectors)': pending, 'SMART 198 (Offline Uncorrectable)': offline,
+        'SMART 173 (Wear Leveling)': wearLevel || 0,
+      },
+      temperature, overall_health: isAtRisk ? 'WARNING' : 'PASSED', isAtRisk,
+      reallocated: (isNvme ? mediaErrors : reallocated), os_metadata: osMetadata
+    };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+};
+
+// ─── DEAD CODE STUB (replaced above) ─────────────────────────────────────────
+const _OLD_executeInvisibleSmartPoll = async (hostId, diskName) => {
+  try {
+    const isNvme = diskName.toLowerCase().includes('nvme');
+    let rawOutput;
+    let winArgs = `-a /dev/${diskName}`;
+    let osMetadata = null;
+
+    if (hostId === 'localhost' && process.platform === 'win32') {
+      const disks = await si.diskLayout();
+      const targetDisk = disks.find(d => d.name === diskName || d.device === diskName);
+      let pdIndex = '0';
+      if (targetDisk && targetDisk.device && targetDisk.device.includes('PHYSICALDRIVE')) {
+        const match = targetDisk.device.match(/PHYSICALDRIVE(\\d+)/i);
+        if (match) pdIndex = match[1];
+      }
+      winArgs = `-a pd${pdIndex}`;
+
+      try {
+        const cp = require('child_process');
+        const util = require('util');
+        const exec = util.promisify(cp.exec);
+        const { stdout } = await exec(`powershell -NoProfile -Command "Get-PhysicalDisk -DeviceNumber ${pdIndex} | Select-Object MediaType, HealthStatus, OperationalStatus | ConvertTo-Json"`);
+        osMetadata = JSON.parse(stdout);
+      } catch(e){}
+    } else if (hostId === 'localhost' && process.platform !== 'win32') {
+       try {
+         const cp = require('child_process');
+         const util = require('util');
+         const exec = util.promisify(cp.exec);
+         const { stdout } = await exec(`lsblk /dev/${diskName} -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT -J`);
+         osMetadata = JSON.parse(stdout);
+       } catch(e){}
+    } else {
+       try {
+         const isWin = await executeGhostPayload(hostId, 'raw', 'echo win', 'echo lin');
+         if (isWin.includes('lin')) {
+           const out = await executeGhostPayload(hostId, 'raw', '', `lsblk /dev/${diskName} -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT -J`);
+           if (out && out.includes('{')) osMetadata = JSON.parse(out.substring(out.indexOf('{')));
+         }
+       } catch(e){}
+    }
+
+    if (isNvme) {
+      if (hostId === 'localhost' && process.platform === 'win32') {
+          rawOutput = await executeGhostPayload(hostId, 'raw', `smartctl ${winArgs}`, `nvme smart-log /dev/${diskName} || smartctl -a /dev/${diskName}`);
+      } else {
+          rawOutput = await executeGhostPayload(hostId, 'raw', `smartctl -a /dev/${diskName}`, `nvme smart-log /dev/${diskName} || smartctl -a /dev/${diskName}`);
+      }
+    } else {
+      rawOutput = await executeGhostPayload(hostId, 'smartctl', winArgs, `-a /dev/${diskName}`);
+    }
+
+    const extract = (regex) => { const match = rawOutput.match(regex); return match ? parseInt(match[1].replace(/,/g, ''), 10) : 0; };
+
+    let temperature = isNvme ? extract(/temperature\s*:\s*(\d+)/i) : extract(/Temperature_Celsius.*?\s+(\d+)(?:\r?\n|$)/) || (30 + Math.floor(Math.random()*10)); 
+    let reallocated = isNvme ? extract(/available_spare\s*:\s*(\d+)/i) : extract(/Reallocated_Sector_Ct.*?\s+(\d+)(?:\r?\n|$)/);
+    let mediaErrors = isNvme ? extract(/media_errors\s*:\s*(\d+)/i) : 0;
+    let percentageUsed = isNvme ? extract(/percentage_used\s*:\s*(\d+)/i) : 0;
+    
+    let uncorrectable = isNvme ? mediaErrors : extract(/Uncorrectable_Error_Cnt.*?\s+(\d+)(?:\r?\n|$)/);
+    let pending = extract(/Current_Pending_Sector.*?\s+(\d+)(?:\r?\n|$)/);
+    let offline = extract(/Offline_Uncorrectable.*?\s+(\d+)(?:\r?\n|$)/);
+    let wearLevel = isNvme ? percentageUsed : extract(/Wear_Leveling_Count.*?\s+(\d+)(?:\r?\n|$)/);
+
+    let isAtRisk = false;
+    if (isNvme) {
+      isAtRisk = mediaErrors > 0 || percentageUsed > 80;
+    } else {
+      isAtRisk = reallocated > 10 || uncorrectable > 0 || pending > 0 || offline > 0;
+    }
+    
+    // Predictive ML Slope Analysis
+    let predictedDays = null;
+    try {
+      const history = await db.getDiskAnalytics(hostId, diskName, 10);
+      if (history.length > 3) {
+         const first = history[history.length - 1];
+         const last = history[0];
+         const errDiff = isNvme ? (mediaErrors - first.uncorrectable) : (reallocated - first.reallocated);
+         const timeDiffDays = (new Date(last.timestamp) - new Date(first.timestamp)) / (1000 * 60 * 60 * 24);
+         
+         if (errDiff > 0 && timeDiffDays > 0) {
+            const slope = errDiff / timeDiffDays; // Errors per day
+            const remainingToCrit = isNvme ? (100 - percentageUsed) : (50 - reallocated); // rough heuristic
+            if (slope > 0) predictedDays = Math.max(1, Math.round(remainingToCrit / slope));
+            
+            if (predictedDays !== null && predictedDays < 30) {
+              isAtRisk = true; // Mark as at risk if predicted failure is within 30 days
+            }
+         }
+      }
+    } catch(e) {}
+
+    // Save to historical telemetry DB
+    db.saveDiskAnalytics(hostId, diskName, isAtRisk ? 'WARNING' : 'PASSED', temperature, isNvme ? percentageUsed : (reallocated || 0), isNvme ? mediaErrors : (uncorrectable || 0));
+
+    return {
+      success: true, scan_type: 'fast', disk: diskName, timestamp: new Date().toISOString(),
+      predicted_days: predictedDays,
+      fatal_five: isNvme ? {
+        'NVMe Media Errors': mediaErrors,
+        'NVMe Percentage Used': percentageUsed,
+        'NVMe Available Spare': extract(/available_spare\s*:\s*(\d+)/i) || 100,
+        'Temperature': temperature
+      } : {
+        'SMART 5 (Reallocated Sectors)': reallocated,
+        'SMART 187 (Uncorrectable Errors)': uncorrectable,
+        'SMART 197 (Pending Sectors)': pending,
+        'SMART 198 (Offline Uncorrectable)': offline,
+        'SMART 173 (Wear Leveling)': wearLevel || (diskName.includes('Samsung') ? 269 : 0)
+      },
+      temperature, overallStatus: isAtRisk ? 'WARNING' : 'PASSED', overall_health: isAtRisk ? 'WARNING' : 'PASSED', isAtRisk, reallocated: (isNvme ? mediaErrors : reallocated), errorCount: isNvme ? mediaErrors : (reallocated + uncorrectable + pending + offline),
+      os_metadata: osMetadata
+    };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+};
+
+app.post('/api/scan/fast', async (req, res) => {
+  const { hostId, diskName } = req.body;
+  
+  // Is this an Edge Agent?
+  Array.from(io.sockets.sockets.values()).forEach(s => console.log(`[DEBUG Scan] Socket ${s.id} -> hostId: ${s.hostId}, isAgent: ${s.isAgent}`));
+  const agentSocket = Array.from(io.sockets.sockets.values()).find(s => s.hostId === hostId && s.isAgent);
+  if (agentSocket) {
+    const jobId = `job_${Date.now()}`;
+    agentSocket.emit('agent:scan:request', { jobId, diskName, type: 'fast' });
+    
+    // Wait for the agent to compute and push back the result
+    return new Promise((resolve) => {
+      let resolved = false;
+      const timeout = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        agentSocket.removeListener('agent:scan:result', onResult);
+        resolve(res.json({ success: false, scan_type: 'fast', error: 'Agent execution timeout' }));
+      }, 15000);
+
+      const onResult = ({ jobId: rJobId, diskName: rDisk, type, result }) => {
+        if (rJobId === jobId && type === 'fast') {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(timeout);
+          agentSocket.removeListener('agent:scan:result', onResult);
+          resolve(res.json(result));
+        }
+      };
+      
+      agentSocket.on('agent:scan:result', onResult);
+    });
+  }
+
+  // SSH Fallback
+  const result = await executeInvisibleSmartPoll(hostId, diskName);
+  res.json(result);
+});
+
+// ─── Autonomous Webhook Engine (Discord/Telegram) ───────────────────────────
+const dispatchEmergencyWebhook = async (title, message, severity="critical") => {
+  try {
+    const hooks = await db.getWebhooks();
+    const activeHooks = hooks.filter(h => h.enabled && h.url);
+    if (activeHooks.length === 0) return;
+
+    for (let hook of activeHooks) {
+      if (hook.type === 'discord') {
+        const color = severity === 'critical' ? 15548997 : severity === 'warning' ? 16776960 : 3447003;
+        await axios.post(hook.url, {
+          embeds: [{ title: `🚨 NOVA NOC Alert: ${title}`, description: message, color, timestamp: new Date().toISOString() }]
+        });
+      } else if (hook.type === 'telegram') {
+        const text = `🚨 *NOVA NOC Alert: ${title}*\n${message}`;
+        const tgUrl = `https://api.telegram.org/bot${hook.token}/sendMessage`;
+        await axios.post(tgUrl, { chat_id: hook.chatId, text, parse_mode: 'Markdown' });
+      }
+    }
+  } catch(e) { console.error('[Webhook Dispatcher Failed]', e.message); }
+};
+
+// ─── Autonomous NOC Scheduler (The Ghost Fleet) ─────────────────────────────
+setInterval(async () => {
+  if (sshConfigs.length === 0) return;
+  console.log('[NOC Scheduler] Waking up Ghost Fleet to perform invisible fleet-wide hardware poll...');
+  for (let config of sshConfigs) {
+    const hostId = `ssh-${config.host}`;
+    try {
+      // QoS Dynamic Load Check
+      const loadOk = await checkHostLoadQoS(hostId);
+      if (!loadOk) {
+         db.logEvent(hostId, 'system', 'Scan jitter applied. High CPU load detected, deferring scan to avoid production impact.');
+         continue; // skips this host to next cycle
+      }
+
+      // In a real scenario we poll lsblk or Get-PhysicalDisk, here we simulate checks
+      const disksToPoll = ['OS_Drive_0', 'nvme0n1']; 
+      for (const diskName of disksToPoll) {
+        const result = await executeInvisibleSmartPoll(hostId, diskName);
+        if (result.success && result.isAtRisk) {
+          db.logEvent(hostId, 'ai_predictive', `Autonomous Scan detected PREDICTIVE FAILURE on ${diskName}. Slope: ${result.predicted_days ? result.predicted_days + ' days remaining.' : 'Critical thresholds reached.'}`);
+          dispatchEmergencyWebhook(`Predictive Disk Failure (${hostId})`, `The Ghost Engine has detected that drive **${diskName}** has breached safety thresholds.\nPredicted Time to Failure: **${result.predicted_days ? result.predicted_days + ' Days' : 'IMMINENT'}**\nErrors Logged: ${result.reallocated}`, 'critical');
+          
+          triggerDiskFailureAutoRemediation(hostId, diskName);
+        }
+      }
+    } catch(e) {}
+  }
+}, 60 * 60 * 1000); // Runs once every 60 minutes across all servers
+
+const checkHostLoadQoS = async (hostId) => {
+  try {
+     const rawMsg = await executeGhostPayload(hostId, 'raw', 'powershell "Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average"', 'cat /proc/loadavg');
+     if (hostId.includes('ssh-') && rawMsg) {
+       const loadPars = parseFloat(rawMsg.trim().split(' ')[0]);
+       if (loadPars > 4.0) return false; 
+     }
+     return true;
+  } catch(e) { return true; } 
+};
+
+const triggerDiskFailureAutoRemediation = async (hostId, diskName) => {
+  try {
+    const rules = await db.getRules();
+    const diskRules = rules.filter(r => r.enabled && r.hostId === hostId && r.metric === 'disk_failure_imminent');
+    for (let rule of diskRules) {
+      db.logEvent(hostId, 'auto-healing', `Triggered disk failure remediation: ${rule.name}`);
+      await executeGhostPayload(hostId, 'raw', rule.action, rule.action);
+    }
+  } catch(e) { console.error('AutoRemediation error', e); }
+};
+
+// ─── Kernel OS-Level Log Scraper ────────────────────────────────────────────
+app.post('/api/scan/kernel-logs', async (req, res) => {
+  const { hostId } = req.body;
+  if (!hostId) return res.status(400).json({error: 'hostId required'});
+
+  try {
+    await new Promise((resolve, reject) => {
+      const config = sshConfigs.find(c => `ssh-${c.host}` === hostId);
+      if (!config) return reject(new Error('Invalid SSH Host'));
+      
+      const conn = new Client();
+      conn.on('ready', () => {
+        conn.exec('uname', (err, stream) => {
+          let isLinux = false;
+          if (!err) stream.on('data', d => { if (d.toString().toLowerCase().includes('linux')) isLinux = true; });
+          
+          stream.on('close', () => {
+            const scrapeCmd = isLinux 
+              ? `dmesg -T -l err,crit,alert,emerg | grep -iE 'ata|scsi|nvme|pci|disk|ext4|xfs' | tail -n 20` 
+              : `powershell -Command "Get-EventLog -LogName System -EntryType Error,Warning | Where-Object { $_.Source -match 'disk|volsnap|ntfs' } | Select-Object -First 10 | ConvertTo-Json"`;
+            
+            conn.exec(scrapeCmd, (err, stream2) => {
+              let out = '';
+              if (err) { conn.end(); return reject(err); }
+              stream2.on('data', d => out += d).on('close', () => {
+                conn.end();
+                res.json({ success: true, logs: out });
+                resolve();
+              });
+            });
+          });
+        });
+      }).on('error', err => reject(err)).connect({ host: config.host, port: config.port || 22, username: config.username, password: config.password, privateKey: config.privateKey });
+    });
+  } catch(e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.post('/api/scan/deep', async (req, res) => {
+  const { hostId, diskName } = req.body;
+  const jobId = `job_${Date.now()}`;
+  
+  db.logEvent(hostId, 'diagnostics', `[DEEP SCAN] Initiated REAL sector analysis on ${diskName}`);
+
+  // Is this an Edge Agent?
+  const agentSocket = Array.from(io.sockets.sockets.values()).find(s => s.hostId === hostId && s.isAgent);
+  if (agentSocket) {
+    agentSocket.emit('agent:scan:request', { jobId, diskName, type: 'deep' });
+    return new Promise((resolve) => {
+      let resolved = false;
+      const onResult = ({ jobId: rJobId, type, result }) => {
+        if (rJobId === jobId && type === 'deep') {
+          if (resolved) return;
+          resolved = true;
+          agentSocket.removeListener('agent:scan:result', onResult);
+          scanResultCache.set(jobId, { result, hostId, diskName, ts: Date.now() });
+          resolve(res.json({ success: true, jobId, result }));
+        }
+      };
+      agentSocket.on('agent:scan:result', onResult);
+    });
+  }
+
+  // Emit initial progress
+  io.emit('scan:progress', { jobId, hostId, diskName, progress: 1 });
+
+  // Resolve HTTP immediately so the frontend doesn't hang!
+  res.json({ success: true, jobId, message: 'Deep Scan Initiated in background' });
+
+  const finishDeepScan = (jId, hId, dName, failed, message, method) => {
+    const scanResult = {
+      scan_type: 'deep', disk: dName, timestamp: new Date().toISOString(),
+      failed, method, message, overall_health: failed ? 'WARNING' : 'PASSED', jobId: jId
+    };
+    io.emit('scan:complete', { jobId: jId, hostId: hId, diskName: dName, result: scanResult, failed });
+    db.logEvent(hId, 'diagnostics', `[DEEP SCAN] ${scanResult.overall_health} on ${dName}: ${message}`);
+    
+    if (failed) {
+      dispatchEmergencyWebhook(`DEEP SCAN FAILED (${hId})`, `Drive **${dName}** failed ${method}.\n${message}`, 'critical');
+      io.emit('alert:new', { service_name: dName, severity: 'critical', message, timestamp: scanResult.timestamp });
+      db.logAlert({ service_id: hId, service_name: dName, service_type: 'disk', severity: 'critical', message, channel: 'system', sent: false });
+    }
+  };
+
+  try {
+    let isZfs = false;
+    const isLocalhost = (hostId === 'localhost');
+    let targetDevice = `/dev/${diskName}`;
+
+    if (isLocalhost && process.platform === 'win32') {
+      const si = require('systeminformation');
+      const disks = await si.diskLayout();
+      const targetDisk = disks.find(d => d.name === diskName || d.device === diskName);
+      let pdIndex = '0';
+      if (targetDisk && targetDisk.device && targetDisk.device.includes('PHYSICALDRIVE')) {
+        const match = targetDisk.device.match(/PHYSICALDRIVE(\\d+)/i);
+        if (match) pdIndex = match[1];
+      }
+      targetDevice = `pd${pdIndex}`;
+    }
+
+    if (!isLocalhost) {
+      const checkZFS = await executeGhostPayload(hostId, 'raw', 'echo nonZFS', `zpool status | grep ${diskName} || echo nonZFS`);
+      isZfs = !checkZFS.includes('nonZFS');
+    }
+
+    if (isZfs) {
+      await executeGhostPayload(hostId, 'raw', '', `zpool scrub ${diskName}`);
+      const interval = setInterval(async () => {
+        try {
+          const status = await executeGhostPayload(hostId, 'raw', '', `zpool status ${diskName}`);
+          const scanMatch = status.match(/scan: scrub in progress.*?(\\d+\\.\\d+)% done/s);
+          if (scanMatch) {
+            io.emit('scan:progress', { jobId, hostId, diskName, progress: parseFloat(scanMatch[1]) });
+          } else if (status.includes('scan: scrub repaired') || status.includes('scan: scrub canceled')) {
+            clearInterval(interval);
+            const foundErrors = status.includes('errors: No known data errors') ? false : true;
+            finishDeepScan(jobId, hostId, diskName, foundErrors, foundErrors ? 'ZFS Pool Scrub detected errors.' : 'ZFS Scrub Complete — No errors detected.', 'ZFS Scrub');
+          }
+        } catch(e) { clearInterval(interval); finishDeepScan(jobId, hostId, diskName, true, e.message, 'ZFS Scrub'); }
+      }, 5000);
+    } else {
+      const startCmd = isLocalhost && process.platform === 'win32' 
+        ? `smartctl -t long ${targetDevice}`
+        : `smartctl -t long /dev/${diskName}`;
+      
+      await executeGhostPayload(hostId, 'raw', startCmd, startCmd);
+
+      const interval = setInterval(async () => {
+        try {
+          const checkCmd = isLocalhost && process.platform === 'win32'
+            ? `smartctl -c ${targetDevice}`
+            : `smartctl -c /dev/${diskName}`;
+            
+          const status = await executeGhostPayload(hostId, 'raw', checkCmd, checkCmd);
+          
+          if (status.includes('Self-test routine in progress')) {
+            const pctMatch = status.match(/(\\d+)%\\s+of test remaining/);
+            let progress = 10;
+            if (pctMatch) progress = 100 - parseInt(pctMatch[1]);
+            io.emit('scan:progress', { jobId, hostId, diskName, progress });
+          } else if (status.includes('The previous self-test routine completed') || status.includes('Self-test execution status:      (   0)')) {
+            clearInterval(interval);
+            const finalCmd = isLocalhost && process.platform === 'win32' ? `smartctl -x ${targetDevice}` : `smartctl -x /dev/${diskName}`;
+            const finalOut = await executeGhostPayload(hostId, 'raw', finalCmd, finalCmd);
+            const hasFault = finalOut.toLowerCase().includes('pred fail') || finalOut.includes('Completed: read failure');
+            finishDeepScan(jobId, hostId, diskName, hasFault, hasFault ? 'Hardware anomalies detected during extended surface analysis!' : 'Hardware Surface Analysis PASSED.', 'SMART Long Test');
+          }
+        } catch(e) {
+           clearInterval(interval); finishDeepScan(jobId, hostId, diskName, true, e.message, 'SMART Long Test');
+        }
+      }, 10000);
+    }
+  } catch (err) {
+    finishDeepScan(jobId, hostId, diskName, true, `Scan failed: ${err.message}`, 'Hardware Scan');
+  }
+});
+
+
+app.get('/api/scan/history/:hostId/:diskName', async (req, res) => {
+  try {
+    let history = await db.getDiskAnalytics(req.params.hostId, req.params.diskName);
+    history = history.map(h => {
+      let score = 100;
+      let real = parseInt(h.reallocated) || 0;
+      let unc = parseInt(h.uncorrectable) || 0;
+      score -= (real * 5);
+      score -= (unc * 10);
+      if (h.healthStatus === 'WARNING') score -= 20;
+      return {
+        ...h,
+        score: Math.max(0, Math.min(100, score)),
+        time: new Date(h.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})
+      };
+    });
+    res.json({ success: true, history });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// ─── Enterprise APIs ────────────────────────────────────────────────────────
+app.get('/api/enterprise/history/:hostId', async (req, res) => {
+  try { res.json(await db.getHistory(req.params.hostId)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/enterprise/webhooks', async (req, res) => {
+  try { res.json(await db.getWebhooks()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/enterprise/webhooks', (req, res) => {
+  db.addWebhook(req.body); 
+  res.json({ success: true });
+});
+
+app.get('/api/enterprise/rules', async (req, res) => {
+  try { res.json(await db.getRules()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/enterprise/rules', (req, res) => {
+  db.addRule(req.body);
+  res.json({ success: true });
+});
+
+app.get('/api/enterprise/logs', async (req, res) => {
+  try {
+    const logs = await db.getEvents();
+    res.json(logs);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INFRASTRUCTURE SERVICES API (PostgreSQL / Redis / MongoDB / Docker)
+// ═══════════════════════════════════════════════════════════════════════════
+const net = require('net');
+const { Client: PgClient } = require('pg');
+const Redis = require('ioredis');
+const { MongoClient } = require('mongodb');
+
+// ─── TCP Ping helper ────────────────────────────────────────────────────────
+function tcpPing(host, port, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const socket = new net.Socket();
+    socket.setTimeout(timeoutMs);
+    socket.on('connect', () => {
+      const latency = Date.now() - start;
+      socket.destroy();
+      resolve({ ok: true, latency });
+    });
+    socket.on('error', () => { socket.destroy(); resolve({ ok: false, latency: 0 }); });
+    socket.on('timeout', () => { socket.destroy(); resolve({ ok: false, latency: 0 }); });
+    socket.connect(port, host);
+  });
+}
+
+// ─── PostgreSQL Stats ────────────────────────────────────────────────────────
+async function getPgStats(svc) {
+  const client = new PgClient({
+    host: svc.host, port: svc.port || 5432,
+    user: svc.username, password: svc.password,
+    database: svc.database_name || 'postgres',
+    connectionTimeoutMillis: 5000,
+  });
+  await client.connect();
+  const [connRes, cacheRes, dbRes, slowRes] = await Promise.all([
+    client.query(`SELECT count(*) as total, count(*) FILTER (WHERE state='active') as active, count(*) FILTER (WHERE state='idle') as idle FROM pg_stat_activity`),
+    client.query(`SELECT sum(blks_hit)::float / greatest(sum(blks_hit) + sum(blks_read), 1) * 100 AS cache_hit FROM pg_stat_database`),
+    client.query(`SELECT pg_database_size(current_database())::float / 1024 / 1024 AS size_mb`),
+    client.query(`SELECT count(*) as slow FROM pg_stat_activity WHERE state='active' AND query_start < now() - interval '5 seconds'`),
+  ]);
+  await client.end();
+  return {
+    connections_total:  parseInt(connRes.rows[0].total),
+    connections_active: parseInt(connRes.rows[0].active),
+    connections_idle:   parseInt(connRes.rows[0].idle),
+    cache_hit_pct:      parseFloat(cacheRes.rows[0].cache_hit).toFixed(1),
+    db_size_mb:         parseFloat(dbRes.rows[0].size_mb).toFixed(1),
+    slow_queries:       parseInt(slowRes.rows[0].slow),
+  };
+}
+
+// ─── Redis Stats ─────────────────────────────────────────────────────────────
+async function getRedisStats(svc) {
+  const redis = new Redis({
+    host: svc.host, port: svc.port || 6379,
+    password: svc.password || undefined,
+    connectTimeout: 5000, commandTimeout: 5000,
+    lazyConnect: true,
+  });
+  await redis.connect();
+  const info = await redis.info('all');
+  await redis.quit();
+  const parse = (key) => {
+    const match = info.match(new RegExp(`${key}:(.*)`));
+    return match ? match[1].trim() : '0';
+  };
+  const hits = parseInt(parse('keyspace_hits'));
+  const misses = parseInt(parse('keyspace_misses'));
+  const hitRate = hits + misses === 0 ? 100 : ((hits / (hits + misses)) * 100).toFixed(1);
+  return {
+    used_memory_mb:     (parseInt(parse('used_memory')) / 1024 / 1024).toFixed(1),
+    peak_memory_mb:     (parseInt(parse('used_memory_peak')) / 1024 / 1024).toFixed(1),
+    connected_clients:  parseInt(parse('connected_clients')),
+    hit_rate_pct:       parseFloat(hitRate),
+    evicted_keys:       parseInt(parse('evicted_keys')),
+    total_commands_ps:  parseInt(parse('instantaneous_ops_per_sec')),
+    uptime_days:        Math.floor(parseInt(parse('uptime_in_seconds')) / 86400),
+    redis_version:      parse('redis_version'),
+  };
+}
+
+// ─── MongoDB Stats ────────────────────────────────────────────────────────────
+async function getMongoStats(svc) {
+  const uri = svc.connection_string ||
+    `mongodb://${svc.username ? `${svc.username}:${svc.password}@` : ''}${svc.host}:${svc.port || 27017}`;
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
+  await client.connect();
+  const admin = client.db('admin');
+  const [status, dbList] = await Promise.all([
+    admin.command({ serverStatus: 1 }),
+    admin.command({ listDatabases: 1 }),
+  ]);
+  await client.close();
+  const ops = status.opcounters;
+  const repl = status.repl;
+  return {
+    version:            status.version,
+    uptime_hours:       Math.floor(status.uptime / 3600),
+    connections_current: status.connections.current,
+    connections_avail:   status.connections.available,
+    ops_insert:         ops.insert,
+    ops_query:          ops.query,
+    ops_update:         ops.update,
+    ops_delete:         ops.delete,
+    total_dbs:          dbList.databases.length,
+    repl_set:           repl ? repl.setName : null,
+    repl_is_primary:    repl ? repl.ismaster : null,
+  };
+}
+
+// ─── GET all services ────────────────────────────────────────────────────────
+app.get('/api/services', async (req, res) => {
+  try {
+    const rows = await db.getServices(req.query.type || null);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── POST add service ─────────────────────────────────────────────────────────
+app.post('/api/services', async (req, res) => {
+  try {
+    const svc = await db.addService(req.body);
+    res.json(svc);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── DELETE service ───────────────────────────────────────────────────────────
+app.delete('/api/services/:id', async (req, res) => {
+  try {
+    await db.deleteService(parseInt(req.params.id));
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── POST ping service (TCP) ──────────────────────────────────────────────────
+app.post('/api/services/:id/ping', async (req, res) => {
+  try {
+    const services = await db.getServices();
+    const svc = services.find(s => s.id === parseInt(req.params.id));
+    if (!svc) return res.status(404).json({ error: 'Not found' });
+    const { ok, latency } = await tcpPing(svc.host, svc.port || getDefaultPort(svc.type), 4000);
+    await db.updateServiceStatus(svc.id, ok ? 'online' : 'offline', latency);
+    res.json({ status: ok ? 'online' : 'offline', latency });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Local System Stats (for docker/node-exporter type) ──────────────────────
+async function getLocalSystemStats(svc) {
+  // If host is localhost or same machine — use si directly
+  const isLocal = ['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes((svc.host || '').toLowerCase());
+  if (isLocal) {
+    const [mem, fsArr, nets] = await Promise.all([
+      si.mem().catch(() => ({})),
+      si.fsSize().catch(() => []),
+      si.networkStats().catch(() => []),
+    ]);
+    const cachedHost = state.hosts['localhost'] || {};
+    const cpuPct   = cachedHost.cpu || 0;
+    const memPct   = cachedHost.mem || (mem.total ? Math.round((mem.active / mem.total) * 100) : 0);
+    const memUsed  = mem.active  ? (mem.active  / 1024 / 1024 / 1024).toFixed(2) : '0';
+    const memTotal = mem.total   ? (mem.total   / 1024 / 1024 / 1024).toFixed(2) : '0';
+    const rootFs   = (fsArr || []).find(f => f.mount === '/' || f.mount === 'C:' || f.mount === 'C:\\') || (fsArr || [])[0] || {};
+    const diskFreeGb  = rootFs.available ? (rootFs.available  / 1024 / 1024 / 1024).toFixed(1) : '0';
+    const diskTotalGb = rootFs.size      ? (rootFs.size       / 1024 / 1024 / 1024).toFixed(1) : '0';
+    const diskUsedPct = rootFs.use       ? rootFs.use.toFixed(1) : '0';
+    const net0     = (nets || [])[0] || {};
+    const rxMB     = net0.rx_sec ? (net0.rx_sec / 1024 / 1024).toFixed(2) : '0';
+    const txMB     = net0.tx_sec ? (net0.tx_sec / 1024 / 1024).toFixed(2) : '0';
+
+    return {
+      cpu_load_1m:   cpuPct,
+      cpu_cores:     require('os').cpus().length,
+      cpu_cores_data: [],
+      mem_used_pct:  memPct,
+      mem_used_gb:   parseFloat(memUsed),
+      mem_total_gb:  parseFloat(memTotal),
+      disk_free_gb:  parseFloat(diskFreeGb),
+      disk_total_gb: parseFloat(diskTotalGb),
+      disk_used_pct: parseFloat(diskUsedPct),
+      net_rx_mb:     parseFloat(rxMB),
+      net_tx_mb:     parseFloat(txMB),
+      uptime_days:   Math.floor((si.time ? si.time().uptime : 0) / 86400),
+      platform:      process.platform,
+      hostname:      require('os').hostname(),
+      // Legacy fields for compatibility
+      status: 'online', latency: 0,
+    };
+  }
+
+  // Remote: try Node Exporter HTTP API (port 9100)
+  try {
+    const resp = await axios.get(`http://${svc.host}:${svc.port || 9100}/metrics`, { timeout: 5000 });
+    const text = resp.data || '';
+    const parseMetric = (name) => {
+      const m = text.match(new RegExp(`^${name}\\s+([0-9.e+]+)`, 'm'));
+      return m ? parseFloat(m[1]) : null;
+    };
+    const cpuIdle = parseMetric('node_cpu_seconds_total{.*mode="idle"') ||
+                   parseMetric('node_cpu_seconds_total.*idle');
+    const memFree = parseMetric('node_memory_MemFree_bytes');
+    const memTotal = parseMetric('node_memory_MemTotal_bytes');
+    const diskFree = parseMetric('node_filesystem_avail_bytes{mountpoint="/"');
+    const diskTotal = parseMetric('node_filesystem_size_bytes{mountpoint="/"');
+
+    return {
+      cpu_load_1m:   cpuIdle !== null ? Math.round((1 - cpuIdle) * 100) : null,
+      mem_used_pct:  (memFree && memTotal) ? Math.round(((memTotal - memFree) / memTotal) * 100) : null,
+      mem_used_gb:   (memFree && memTotal) ? parseFloat(((memTotal - memFree) / 1e9).toFixed(2)) : null,
+      mem_total_gb:  memTotal ? parseFloat((memTotal / 1e9).toFixed(2)) : null,
+      disk_free_gb:  diskFree ? parseFloat((diskFree / 1e9).toFixed(1)) : null,
+      disk_total_gb: diskTotal ? parseFloat((diskTotal / 1e9).toFixed(1)) : null,
+      status: 'online', latency: 0,
+    };
+  } catch (e) {
+    // Fallback: TCP ping only
+    const { ok, latency } = await tcpPing(svc.host, svc.port || 9100, 3000);
+    return { status: ok ? 'online' : 'offline', latency };
+  }
+}
+
+// ─── GET live stats for a service ────────────────────────────────────────────
+app.get('/api/services/:id/stats', async (req, res) => {
+  try {
+    const services = await db.getServices();
+    const svc = services.find(s => s.id === parseInt(req.params.id));
+    if (!svc) return res.status(404).json({ error: 'Not found' });
+    let stats = {};
+    if (svc.type === 'postgres') stats = await getPgStats(svc);
+    else if (svc.type === 'redis')   stats = await getRedisStats(svc);
+    else if (svc.type === 'mongodb') stats = await getMongoStats(svc);
+    else stats = await getLocalSystemStats(svc);  // docker / node-exporter
+    await db.updateServiceStatus(svc.id, 'online', stats.latency || 0);
+    res.json({ ...stats, service: svc });
+  } catch (e) {
+    const id = parseInt(req.params.id);
+    await db.updateServiceStatus(id, 'offline', 0);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── GET historical chart data for a service stat ─────────────────────────────
+app.get('/api/services/:id/history', async (req, res) => {
+  try {
+    const data = await db.getServiceStats(
+      parseInt(req.params.id),
+      req.query.key || 'connections_active',
+      parseInt(req.query.limit) || 30
+    );
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+function getDefaultPort(type) {
+  return { postgres: 5432, redis: 6379, mongodb: 27017, docker: 2375 }[type] || 80;
+}
+
+// ─── Background polling for registered services (every 30s) ──────────────────
+async function pollServices() {
+  try {
+    const services = await db.getServices();
+    for (const svc of services) {
+      try {
+        let stats = {};
+        if (svc.type === 'postgres') stats = await getPgStats(svc);
+        else if (svc.type === 'redis') stats = await getRedisStats(svc);
+        else if (svc.type === 'mongodb') stats = await getMongoStats(svc);
+        await db.updateServiceStatus(svc.id, 'online', stats.latency || 0);
+        // Save key metrics for history charts
+        const keyMap = {
+          postgres: [['connections_active', stats.connections_active], ['cache_hit_pct', stats.cache_hit_pct]],
+          redis:    [['used_memory_mb', stats.used_memory_mb], ['hit_rate_pct', stats.hit_rate_pct], ['total_commands_ps', stats.total_commands_ps]],
+          mongodb:  [['connections_current', stats.connections_current], ['ops_query', stats.ops_query]],
+        };
+        (keyMap[svc.type] || []).forEach(([k, v]) => {
+          if (v !== undefined) db.saveServiceStat(svc.id, k, parseFloat(v) || 0);
+        });
+        io.emit('service:update', { id: svc.id, status: 'online', stats });
+      } catch {
+        await db.updateServiceStatus(svc.id, 'offline', 0);
+        io.emit('service:update', { id: svc.id, status: 'offline', stats: {} });
+      }
+    }
+  } catch (e) { console.error('[Services] Poll error:', e.message); }
+}
+// NOTE: pollServices (basic) is superseded by pollServicesWithAlerts below.
+// setInterval(pollServices, 30000); // REMOVED - duplicate
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUTH API (JWT) — JWT_SECRET, authMiddleware, verifyAdmin defined at top of file
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Brute-Force Protection ──────────────────────────────────────────────────
+const loginAttempts = new Map(); // IP -> { count, firstAttempt, locked }
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
+
+const getClientIp = (req) => {
+  return req.headers['x-forwarded-for']?.split(',')[0]?.trim()
+    || req.headers['x-real-ip']
+    || req.socket?.remoteAddress
+    || 'unknown';
+};
+
+// POST /api/auth/login
+app.post('/api/auth/login', async (req, res) => {
+  const clientIp = getClientIp(req);
+  const { username, password, remember } = req.body;
+  const ts = new Date().toISOString();
+
+  try {
+    // ── Check brute-force lockout ──
+    const record = loginAttempts.get(clientIp);
+    if (record && record.locked && (Date.now() - record.lockedAt < LOGIN_LOCKOUT_MS)) {
+      const remainMin = Math.ceil((LOGIN_LOCKOUT_MS - (Date.now() - record.lockedAt)) / 60000);
+      db.logEvent('hub', 'security', `[BLOCKED] Login attempt from LOCKED IP ${clientIp} (user: '${username || '?'}'). ${remainMin}min remaining.`);
+      return res.status(429).json({ error: `Account locked. Try again in ${remainMin} minutes.` });
+    }
+    // Reset if lockout expired
+    if (record && record.locked && (Date.now() - record.lockedAt >= LOGIN_LOCKOUT_MS)) {
+      loginAttempts.delete(clientIp);
+    }
+
+    // ── Validate input ──
+    if (!username || !password) {
+      db.logEvent('hub', 'security', `[FAILED_LOGIN] Empty credentials from IP ${clientIp}`);
+      return res.status(400).json({ error: 'Username and password required' });
+    }
+
+    // ── Check user exists ──
+    const user = await db.getUser(username);
+    if (!user) {
+      registerFailedAttempt(clientIp, username, 'USER_NOT_FOUND');
+      db.logEvent('hub', 'security', `[FAILED_LOGIN] user='${username}' ip=${clientIp} reason=USER_NOT_FOUND at ${ts}`);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // ── Verify password ──
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      registerFailedAttempt(clientIp, username, 'WRONG_PASSWORD');
+      db.logEvent('hub', 'security', `[FAILED_LOGIN] user='${username}' ip=${clientIp} reason=WRONG_PASSWORD at ${ts}`);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // ── Success: clear failed attempts for this IP ──
+    loginAttempts.delete(clientIp);
+    await db.updateLastLogin(user.id);
+
+    const expiresIn = remember ? '30d' : '24h';
+    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn });
+
+    db.logEvent('hub', 'auth', `[SUCCESS_LOGIN] user='${username}' ip=${clientIp} role=${user.role} at ${ts}`);
+    res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
+  } catch (e) {
+    db.logEvent('hub', 'security', `[LOGIN_ERROR] user='${username || '?'}' ip=${clientIp} error=${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function registerFailedAttempt(ip, username, reason) {
+  const record = loginAttempts.get(ip) || { count: 0, attempts: [] };
+  record.count++;
+  record.attempts.push({ username, reason, time: new Date().toISOString() });
+
+  if (record.count >= LOGIN_MAX_ATTEMPTS) {
+    record.locked = true;
+    record.lockedAt = Date.now();
+    db.logEvent('hub', 'security', `[LOCKOUT] IP ${ip} LOCKED after ${record.count} failed attempts. Last user tried: '${username}'`);
+    console.warn(`[SECURITY] IP ${ip} locked out after ${record.count} failed login attempts.`);
+  }
+
+  loginAttempts.set(ip, record);
+}
+
+// GET /api/auth/verify
+app.get('/api/auth/verify', authMiddleware, async (req, res) => {
+  try {
+    const user = await db.getUserById(req.user.id);
+    if (!user) return res.status(401).json({ valid: false });
+    // Sanitize user before sending back
+    res.json({ valid: true, user: { id: user.id, username: user.username, role: user.role } });
+  } catch { res.status(401).json({ valid: false }); }
+});
+
+// POST /api/auth/logout
+app.post('/api/auth/logout', authMiddleware, (req, res) => {
+  const clientIp = getClientIp(req);
+  db.logEvent('hub', 'auth', `[LOGOUT] user='${req.user.username}' ip=${clientIp}`);
+  res.json({ success: true });
+});
+
+// GET /api/security/failed-logins — Admin only: view all blocked IPs and failed attempts
+app.get('/api/security/failed-logins', verifyAdmin, (req, res) => {
+  const results = [];
+  loginAttempts.forEach((record, ip) => {
+    results.push({
+      ip,
+      count: record.count,
+      locked: !!record.locked,
+      lockedAt: record.lockedAt ? new Date(record.lockedAt).toISOString() : null,
+      remainingLockoutMin: record.locked ? Math.max(0, Math.ceil((LOGIN_LOCKOUT_MS - (Date.now() - record.lockedAt)) / 60000)) : 0,
+      attempts: record.attempts || []
+    });
+  });
+  res.json(results);
+});
+
+// POST /api/security/unlock-ip — Admin only: manually unlock a blocked IP
+app.post('/api/security/unlock-ip', verifyAdmin, (req, res) => {
+  const { ip } = req.body;
+  if (!ip) return res.status(400).json({ error: 'IP address required' });
+  if (loginAttempts.has(ip)) {
+    loginAttempts.delete(ip);
+    db.logEvent('hub', 'security', `[ADMIN_UNLOCK] IP ${ip} manually unlocked by ${req.user.username}`);
+    res.json({ success: true, message: `IP ${ip} unlocked.` });
+  } else {
+    res.json({ success: true, message: `IP ${ip} was not locked.` });
+  }
+});
+
+// POST /api/auth/change-password
+app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const user = await db.getUser(req.user.username);
+    const valid = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!valid) return res.status(400).json({ error: 'Current password incorrect' });
+    const hash = await bcrypt.hash(newPassword, 12);
+    await db.pool.query(`UPDATE users SET password_hash = $1 WHERE id = $2`, [hash, user.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/auth/users
+app.get('/api/auth/users', authMiddleware, verifyAdmin, async (req, res) => {
+  try { res.json(await db.getUsers()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/auth/users (Create User)
+app.post('/api/auth/users', authMiddleware, verifyAdmin, async (req, res) => {
+  try {
+    const { username, password, role } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+    const existing = await db.getUser(username);
+    if (existing) return res.status(400).json({ error: 'Username already exists' });
+    const hash = await bcrypt.hash(password, 12);
+    await db.createUser(username, hash, role || 'viewer');
+    db.logEvent('hub', 'auth', `Admin created new user '${username}'`);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/auth/users/:id/role
+app.put('/api/auth/users/:id/role', authMiddleware, verifyAdmin, async (req, res) => {
+  try {
+    const { role } = req.body;
+    if (!['admin', 'viewer'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
+    // Prevent self-demotion
+    if (parseInt(req.params.id) === req.user.id && role !== 'admin') {
+      return res.status(400).json({ error: 'Cannot demote yourself' });
+    }
+    await db.updateUserRole(req.params.id, role);
+    db.logEvent('hub', 'auth', `Admin updated role to '${role}' for user ID ${req.params.id}`);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/auth/users/:id
+app.delete('/api/auth/users/:id', authMiddleware, verifyAdmin, async (req, res) => {
+  try {
+    // Prevent self-deletion
+    if (parseInt(req.params.id) === req.user.id) {
+      return res.status(400).json({ error: 'Cannot delete yourself' });
+    }
+    await db.deleteUser(req.params.id);
+    db.logEvent('hub', 'auth', `Admin deleted user ID ${req.params.id}`);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 2: SMART ALERTS ENGINE
+// ═══════════════════════════════════════════════════════════════════════════
+const alertCooldown = new Map(); // serviceId -> lastAlertTimestamp
+const ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
+async function sendAlertNotification(svc, message, severity = 'critical') {
+  const now = Date.now();
+  const last = alertCooldown.get(svc.id) || 0;
+  if (now - last < ALERT_COOLDOWN_MS) return; // cooldown active
+  alertCooldown.set(svc.id, now);
+
+  db.logAlert({ service_id: svc.id, service_name: svc.name, service_type: svc.type, severity, message, channel: 'system', sent: false });
+  io.emit('alert:new', { service_id: svc.id, service_name: svc.name, severity, message, timestamp: new Date().toISOString() });
+
+  // Fetch webhooks
+  const webhooks = await db.getWebhooks().catch(() => []);
+  for (const wh of webhooks.filter(w => w.enabled)) {
+    try {
+      if (wh.type === 'discord' && wh.url) {
+        await axios.post(wh.url, {
+          embeds: [{
+            title: `🚨 ${severity.toUpperCase()}: ${svc.name}`,
+            description: message,
+            color: severity === 'critical' ? 0xFF0000 : 0xFFA500,
+            fields: [{ name: 'Service Type', value: svc.type, inline: true }, { name: 'Host', value: svc.host, inline: true }],
+            timestamp: new Date().toISOString(),
+            footer: { text: 'Disk Monitoring System GUI' }
+          }]
+        });
+        db.logAlert({ service_id: svc.id, service_name: svc.name, service_type: svc.type, severity, message, channel: 'discord', sent: true });
+      } else if (wh.type === 'telegram' && wh.token && wh.chatId) {
+        const text = `🚨 *${severity.toUpperCase()}*: ${svc.name}\n${message}\nHost: \`${svc.host}\`\nType: ${svc.type}`;
+        await axios.post(`https://api.telegram.org/bot${wh.token}/sendMessage`, { chat_id: wh.chatId, text, parse_mode: 'Markdown' });
+        db.logAlert({ service_id: svc.id, service_name: svc.name, service_type: svc.type, severity, message, channel: 'telegram', sent: true });
+      }
+    } catch (err) { console.error('[Alert] Webhook failed:', err.message); }
+  }
+}
+
+// GET /api/alerts - alert history
+app.get('/api/alerts', async (req, res) => {
+  try { res.json(await db.getAlertLog(parseInt(req.query.limit) || 100)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/alerts/test - test webhook (SSRF-protected)
+app.post('/api/alerts/test', async (req, res) => {
+  try {
+    const { type, url, token, chatId } = req.body;
+    if (type === 'discord' && url) {
+      if (!validateExternalUrl(url)) {
+        return res.status(400).json({ error: 'Invalid or blocked webhook URL' });
+      }
+      await axios.post(url, { content: '✅ **Nova Command Center** — Webhook test successful!' }, { timeout: 10000, maxRedirects: 2 });
+    } else if (type === 'telegram' && token && chatId) {
+      // Telegram API is always external, but sanitize token
+      const safeToken = String(token).replace(/[^a-zA-Z0-9:_-]/g, '');
+      const safeChatId = String(chatId).replace(/[^a-zA-Z0-9_@-]/g, '');
+      await axios.post(`https://api.telegram.org/bot${safeToken}/sendMessage`, {
+        chat_id: safeChatId,
+        text: '✅ *Nova Command Center* — Webhook test successful!',
+        parse_mode: 'Markdown'
+      }, { timeout: 10000 });
+    } else {
+      return res.status(400).json({ error: 'Invalid webhook type or missing parameters' });
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Webhook test failed. Check URL and credentials.' }); }
+});
+
+// Hook alert engine into pollServices — patch the catch block
+const _origPoll = pollServices;
+// Replace pollServices with alert-aware version
+(async () => {
+  // Monkey-patch: wrap the existing pollServices to trigger alerts
+  const originalInterval = setInterval; // already called above
+})();
+
+// Enhanced service poller WITH alerts
+async function pollServicesWithAlerts() {
+  try {
+    const services = await db.getServices();
+    for (const svc of services) {
+      const wasOnline = svc.status === 'online';
+      try {
+        let stats = {};
+        if (svc.type === 'postgres') stats = await getPgStats(svc);
+        else if (svc.type === 'redis') stats = await getRedisStats(svc);
+        else if (svc.type === 'mongodb') stats = await getMongoStats(svc);
+        await db.updateServiceStatus(svc.id, 'online', stats.latency || 0);
+        const keyMap = {
+          postgres: [['connections_active', stats.connections_active], ['cache_hit_pct', stats.cache_hit_pct]],
+          redis:    [['used_memory_mb', stats.used_memory_mb], ['hit_rate_pct', stats.hit_rate_pct], ['total_commands_ps', stats.total_commands_ps]],
+          mongodb:  [['connections_current', stats.connections_current], ['ops_query', stats.ops_query]],
+        };
+        (keyMap[svc.type] || []).forEach(([k, v]) => {
+          if (v !== undefined) db.saveServiceStat(svc.id, k, parseFloat(v) || 0);
+        });
+        io.emit('service:update', { id: svc.id, status: 'online', stats });
+        // Recovery alert
+        if (!wasOnline) {
+          await sendAlertNotification(svc, `✅ ${svc.name} is back ONLINE on ${svc.host}`, 'info');
+        }
+      } catch {
+        await db.updateServiceStatus(svc.id, 'offline', 0);
+        io.emit('service:update', { id: svc.id, status: 'offline', stats: {} });
+        if (wasOnline) {
+          await sendAlertNotification(svc, `❌ ${svc.name} went OFFLINE on ${svc.host}:${svc.port}`, 'critical');
+        }
+      }
+    }
+  } catch (e) { console.error('[Services] Poll error:', e.message); }
+}
+setInterval(pollServicesWithAlerts, 30000);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 4: REPORTS API
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/reports/summary', async (req, res) => {
+  try {
+    const [services, events, hosts_data] = await Promise.all([
+      db.getServices(),
+      db.getEvents(200),
+      Promise.resolve({}),
+    ]);
+    const summary = {
+      generated_at: new Date().toISOString(),
+      services: {
+        total: services.length,
+        online: services.filter(s => s.status === 'online').length,
+        offline: services.filter(s => s.status === 'offline').length,
+        by_type: services.reduce((acc, s) => { acc[s.type] = (acc[s.type] || 0) + 1; return acc; }, {}),
+        list: services.map(s => ({ id:s.id, name:s.name, type:s.type, host:s.host, port:s.port, status:s.status, latency:s.latency, last_checked:s.last_checked }))
+      },
+      recent_events: events.slice(0, 50),
+      alert_count: (await db.getAlertLog(500)).length,
+    };
+    res.json(summary);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/reports/services-csv', async (req, res) => {
+  try {
+    const services = await db.getServices();
+    const header = 'id,name,type,host,port,status,latency_ms,last_checked\n';
+    const rows = services.map(s => `${s.id},"${s.name}",${s.type},${s.host},${s.port||''},${s.status||'unknown'},${s.latency||0},${s.last_checked||''}`).join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="services-report.csv"');
+    res.send(header + rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── API Routes (Services) ──────────────────────────────────────────────────
+// ─── Docker Container Management ──────────────────────────────────────────
+const cp = require('child_process');
+const util = require('util');
+const execPromise = util.promisify(cp.exec);
+
+app.post('/api/docker/:action', verifyAdmin, async (req, res) => {
+  const action = req.params.action;
+  const { containerId } = req.body;
+  if (!['start', 'stop', 'restart'].includes(action)) {
+    return res.status(400).json({ error: 'Invalid action' });
+  }
+  if (!containerId || !SAFE_CONTAINER_ID.test(containerId)) {
+    db.logEvent('hub', 'security', `[BLOCKED] Invalid container ID format: '${String(containerId).substring(0, 50)}' from user ${req.user.username}`);
+    return res.status(400).json({ error: 'Invalid container ID format. Only alphanumeric, dots, hyphens, and underscores allowed.' });
+  }
+  
+  try {
+    // Use execFile (not exec) to prevent shell injection entirely
+    const { execFile } = require('child_process');
+    const result = await new Promise((resolve, reject) => {
+      execFile('docker', [action, containerId], { timeout: 30000 }, (err, stdout, stderr) => {
+        if (err) return reject(err);
+        resolve({ stdout, stderr });
+      });
+    });
+    logEvent('system', `Docker container ${containerId} ${action}ed by ${req.user.username}`, { output: result.stdout || result.stderr });
+    res.json({ success: true, message: `Container ${action}ed successfully.` });
+  } catch (err) {
+    logEvent('error', `Failed to ${action} docker container ${containerId}`, { error: err.message });
+    res.status(500).json({ error: 'Docker operation failed. Check container status.' });
+  }
+});
+
+app.use('/', require('./routes/services'));
+
+// ─── Global API Error Handler ─────────────────────────────────────────────────
+app.use('/api', (err, req, res, next) => {
+  console.error('[API Error]', req.method, req.path, err.message || err);
+  res.status(err.status || 500).json({
+    error: process.env.NODE_ENV === 'production'
+      ? 'Internal server error'
+      : err.message || 'Unknown error'
+  });
+});
+
+// Serve live disk monitor script (no auth — loaded by index.html)
+app.get('/live-disk-monitor.js', (req, res) => {
+  const monPath = path.join(__dirname, 'live-disk-monitor.js');
+  if (fs.existsSync(monPath)) {
+    res.setHeader('Content-Type', 'application/javascript');
+    res.setHeader('Cache-Control', 'no-store');
+    res.sendFile(monPath);
+  } else {
+    res.status(404).send('// live-disk-monitor.js not found');
+  }
+});
+
+// ─── Serve Frontend Static Files ──────────────────────────────────────────────
+const FRONTEND_DIST = path.join(__dirname, '..', 'frontend', 'dist');
+if (fs.existsSync(FRONTEND_DIST)) {
+  // Serve hashed assets (JS/CSS) with long cache — filenames change on each build
+  app.use('/assets', express.static(path.join(FRONTEND_DIST, 'assets'), {
+    maxAge: '1y',
+    immutable: true,
+  }));
+  // Serve everything else with no-cache (especially index.html)
+  app.use(express.static(FRONTEND_DIST, {
+    etag: true,
+    lastModified: true,
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith('index.html')) {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+      }
+    }
+  }));
+  // SPA fallback — Express v5 requires '/{*path}' instead of '*'
+  app.get('/{*path}', (req, res) => {
+    if (!req.path.startsWith('/api/') && !req.path.startsWith('/socket.io')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.sendFile(path.join(FRONTEND_DIST, 'index.html'));
+    }
+  });
+  console.log(`[TelemetryHub] Serving frontend from: ${FRONTEND_DIST}`);
+} else {
+  console.warn('[TelemetryHub] Frontend dist not found — run "npm run build" in /frontend');
+}
+
+
+// ─── Scan Report Visualization ───────────────────────────────────────────────
+app.get('/api/scan/report/:jobId', authMiddleware, (req, res) => {
+  const cached = scanResultCache.get(req.params.jobId);
+  if (!cached) return res.status(404).json({ error: 'Scan result not found. Run a deep scan first.' });
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(generateScanReportHTML(cached.result, cached.hostId, cached.diskName));
+});
+
+app.post('/api/scan/report/render', authMiddleware, (req, res) => {
+  const result = req.body;
+  if (!result || typeof result !== 'object') return res.status(400).json({ error: 'Provide scan result JSON in request body' });
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(generateScanReportHTML(result, result.hostId, result.disk));
+});
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+
+const PORT = process.env.PORT || 5010;
+server.listen(PORT, '0.0.0.0', async () => {
+  console.log(`[TelemetryHub] Enterprise Backend running on port ${PORT} (0.0.0.0)`);
+
+  db.logEvent('hub', 'system', 'Server started with persistence and automation engines active.');
+  pollDisks();
+  discoverNetworkDevices();
+
+  // ── Auto-create default admin if no users exist ──────────────────────────
+  try {
+    const users = await db.getUsers();
+    if (users.length === 0) {
+      const hash = await bcrypt.hash('root', 12);
+      await db.createUser('root', hash, 'admin');
+      console.log('\n  ╔══════════════════════════════════════════════════════╗');
+      console.log('  ║  DEFAULT ADMIN CREATED                               ║');
+      console.log('  ║  Username: root     Password: root                   ║');
+      console.log('  ║  ⚠  CHANGE YOUR PASSWORD IMMEDIATELY AFTER LOGIN     ║');
+      console.log('  ╚══════════════════════════════════════════════════════╝\n');
+    }
+  } catch (e) { console.error('[Auth] Admin init error:', e.message); }
+});

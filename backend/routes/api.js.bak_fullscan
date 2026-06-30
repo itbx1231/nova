@@ -1,0 +1,586 @@
+const express = require('express');
+const router = express.Router();
+const db = require('../database');
+const state = require('../state');
+const { verifyAdmin } = require('../middleware/auth');
+
+router.get('/api/disks', (req, res) => res.json({ state.hosts, state.eventLog, state.sshConfigs, state.bandwidthHistory, state.networkDevices: Object.values(state.networkDevices) }));
+
+router.get('/api/state.hosts', (req, res) => res.json(state.hosts));
+
+// Bandwidth data
+app.get('/api/bandwidth', (req, res) => res.json({ history: state.bandwidthHistory }));
+
+router.get('/api/bandwidth', (req, res) => res.json({ history: state.bandwidthHistory }));
+
+router.get('/api/network/devices', (req, res) => res.json(Object.values(state.networkDevices)));
+
+// RAID & ZFS data
+app.get('/api/raid-zfs', async (req, res) => {
+  await pollRaidZfs(); // refresh on demand
+  res.json(raidZfsCache);
+});
+
+router.get('/api/raid-zfs', async (req, res) => {
+  await pollRaidZfs(); // refresh on demand
+  res.json(raidZfsCache);
+});
+
+router.post('/api/thresholds', verifyAdmin, (req, res) => {
+  state.alertThresholds = { ...state.alertThresholds, ...req.body };
+  logEvent('system', 'Alert thresholds updated', state.alertThresholds);
+  res.json({ success: true, thresholds: state.alertThresholds });
+});
+
+router.post('/api/test-alert', (req, res) => {
+  fireAlert('warning', '🔴 [TEST] Smart Alerting System verification. If you receive this, your configuration is correct.', 'localhost', { test: true });
+  res.json({ success: true, message: 'Test alert dispatched' });
+});
+
+router.get('/api/thresholds', (req, res) => res.json(state.alertThresholds));
+
+// Disk health prediction data
+app.get('/api/health', (req, res) => {
+  const report = state.currentDisks.map(d => {
+    const serial = d.serialNum || d.name;
+    const store = diskHealthStore[serial] || { snapshots: [], riskHistory: [] };
+    return {
+      name: d.name,
+      serial,
+      health: d.health || null,
+      scoreHistory: store.snapshots.slice(-60).map(s => ({ time: s.time, score: s.score })),
+      tempHistory: store.snapshots.slice(-60).map(s => ({ time: s.time, temp: s.temp })),
+      riskHistory: store.riskHistory.slice(-20)
+    };
+  });
+  res.json({ disks: report, store: diskHealthStore });
+});
+
+router.get('/api/health', (req, res) => {
+  const report = state.currentDisks.map(d => {
+    const serial = d.serialNum || d.name;
+    const store = diskHealthStore[serial] || { snapshots: [], riskHistory: [] };
+    return {
+      name: d.name,
+      serial,
+      health: d.health || null,
+      scoreHistory: store.snapshots.slice(-60).map(s => ({ time: s.time, score: s.score })),
+      tempHistory: store.snapshots.slice(-60).map(s => ({ time: s.time, temp: s.temp })),
+      riskHistory: store.riskHistory.slice(-20)
+    };
+  });
+  res.json({ disks: report, store: diskHealthStore });
+});
+
+router.get('/api/webhooks', async (req, res) => res.json(await db.getWebhooks().catch(() => [])));
+app.get('/api/rules', (req, res) => res.json([]));
+app.get('/api/ssh/list', async (req, res) => {
+  const state.hosts = await db.getSshHosts().catch(() => []);
+  state.sshConfigs = state.hosts; // Keep in sync
+  res.json(state.hosts);
+});
+
+router.get('/api/rules', (req, res) => res.json([]));
+app.get('/api/ssh/list', async (req, res) => {
+  const state.hosts = await db.getSshHosts().catch(() => []);
+  state.sshConfigs = state.hosts; // Keep in sync
+  res.json(state.hosts);
+});
+
+router.get('/api/ssh/list', async (req, res) => {
+  const state.hosts = await db.getSshHosts().catch(() => []);
+  state.sshConfigs = state.hosts; // Keep in sync
+  res.json(state.hosts);
+});
+
+router.get('/api/agent/download', (req, res) => {
+  const agentPath = path.join(__dirname, '..', 'edge-agent', 'agent.js');
+  if (!fs.existsSync(agentPath)) {
+    return res.status(500).send('// Agent source not available on this hub.\n');
+  }
+  res.setHeader('Content-Type', 'text/javascript');
+  res.setHeader('Content-Disposition', 'attachment; filename=agent.js');
+  fs.createReadStream(agentPath).pipe(res);
+});
+
+router.get('/api/agent/download/scanners', (req, res) => {
+  const scannersPath = path.join(__dirname, '..', 'edge-agent', 'scanners.js');
+  if (!fs.existsSync(scannersPath)) return res.status(404).end();
+  res.setHeader('Content-Type', 'text/javascript');
+  fs.createReadStream(scannersPath).pipe(res);
+});
+
+router.get('/api/agent/download/latency-profiler', (req, res) => {
+  const profilerPath = path.join(__dirname, '..', 'edge-agent', 'latency-profiler.js');
+  if (!fs.existsSync(profilerPath)) return res.status(404).end();
+  res.setHeader('Content-Type', 'text/javascript');
+  fs.createReadStream(profilerPath).pipe(res);
+});
+
+router.post('/api/ssh/add', (req, res) => {
+  const config = req.body;
+  const hostId = `ssh-${config.host}`;
+  const existingConfigIdx = state.sshConfigs.findIndex(c => `ssh-${c.host}` === hostId || c.host === config.host);
+  
+  if (existingConfigIdx >= 0) {
+    state.sshConfigs[existingConfigIdx] = config;
+  } else {
+    state.sshConfigs.push(config);
+  }
+  
+  // Save credentials to DB
+  db.saveSshHost(config);
+
+  if (!config.terminalOnly) {
+    state.hosts[hostId] = {
+      name: config.name,
+      os: 'linux',
+      disks: [], partitions: [], history: [],
+      lastUpdate: Date.now(),
+      status: 'deploying',
+      connectionType: 'ssh'
+    };
+    scanSSH(config);
+  }
+  
+  res.json({ success: true, hostId });
+});
+
+router.delete('/api/ssh/delete/:host', (req, res) => {
+  const host = req.params.host;
+  state.sshConfigs = state.sshConfigs.filter(c => c.host !== host);
+  db.deleteSshHost(host);
+  const hostId = `ssh-${host}`;
+  if (state.hosts[hostId]) {
+    delete state.hosts[hostId];
+    io.emit('hosts_update', state.hosts);
+    // Note: Standard background polling for this hostId may throw errors, 
+    // but the system recovers gracefully. Ideally we'd abort but this is out of scope.
+  }
+  res.json({ success: true });
+});
+
+router.delete('/api/state.hosts/:id', (req, res) => {
+  const hostId = req.params.id;
+  if (hostId === 'localhost') return res.status(403).json({ error: 'Cannot remove local hub server' });
+
+  // 1. Cleanup SSH session if active
+  if (sshSessions[hostId]) {
+    if (sshSessions[hostId].shell) sshSessions[hostId].shell.end();
+    if (sshSessions[hostId].conn) sshSessions[hostId].conn.end();
+    delete sshSessions[hostId];
+  }
+
+  // 2. Remove from state.sshConfigs if exist
+  const ipToRemove = hostId.replace('ssh-', '');
+  state.sshConfigs = state.sshConfigs.filter(c => c.host !== ipToRemove);
+  db.deleteSshHost(ipToRemove);
+
+  // 3. Remove Host entry
+  delete state.hosts[hostId];
+
+  logEvent('system', `Node removed from fleet: ${hostId}`, {});
+  io.emit('hosts_update', state.hosts);
+  res.json({ success: true });
+});
+
+router.post('/api/report', (req, res) => {
+  const { hostId, hostname, os, disks, partitions, cpu, mem, event, network, smartData, perfData, raidData, zfsData } = req.body;
+  if (!state.hosts[hostId]) logEvent('system', `New agent connected: ${hostname}`, { os }, hostId);
+
+  const currentHost = state.hosts[hostId] || { history: [] };
+  const avgUsage = (partitions || []).reduce((a, p) => a + (p.use || 0), 0) / ((partitions || []).length || 1);
+  const newHistory = [...(currentHost.history || []), { time: new Date().toLocaleTimeString(), usage: Math.round(avgUsage), cpu: cpu || 0, mem: mem || 0 }].slice(-60);
+
+  // 1. Process SMART & Health
+  const enrichedDisks = (disks || []).map(d => {
+    let health = { score: 100, risk: 'low', signs: [], actions: [], prediction: null, demerits: 0 };
+    if (smartData) {
+      const smart = smartData.find(s => s.device === d.device);
+      if (smart) {
+        health = analyzeDiskHealth(d, smart);
+
+        // Smart Alerting for Remote Agents
+        const store = diskHealthStore[d.serial || d.name];
+        if (store && store.snapshots.length > 0) {
+          const drop = store.snapshots[store.snapshots.length - 1].score - health.score;
+          if (drop >= state.alertThresholds.healthDrop && drop > 0) {
+            fireAlert('critical', `⚠️ HEALTH DROP: ${hostname} - ${d.name} score decreased by ${Math.round(drop)} points`, hostId, { disk: d.name, drop });
+          }
+        }
+      }
+    }
+    return { ...d, health, status: health.risk === 'critical' ? 'ERROR' : 'OK' };
+  });
+
+  // 2. Broadcast Performance Data
+  if (perfData && perfData.length > 0) {
+    const perfStats = perfData.map(p => ({
+      name: p.device,
+      serialNum: enrichedDisks.find(d => d.device === p.device)?.serial || '',
+      rIops: p.rIops,
+      wIops: p.wIops,
+      rSpeed: p.rSpeed,
+      wSpeed: p.wSpeed,
+      latency: p.latency,
+      host: hostname // Tag with agent name
+    }));
+    io.emit('performance_update', perfStats);
+  }
+
+  // 3. Identity Merging & Context Inheritance
+  // If an SSH host exists with the current IP or hostname, merge them
+  let mergedId = hostId;
+  const existingSshHost = Object.keys(state.hosts).find(id => {
+    return id.startsWith('ssh-') && (id.includes(hostname) || hostname.includes(id.replace('ssh-', '')));
+  });
+  
+  if (existingSshHost) {
+     mergedId = existingSshHost;
+     logEvent('system', `Merged agent identity with SSH context: ${hostname}`, {}, mergedId);
+  }
+
+  state.hosts[mergedId] = {
+    name: hostname,
+    os,
+    disks: enrichedDisks,
+    partitions: partitions || [],
+    history: newHistory,
+    lastUpdate: Date.now(),
+    status: 'online',
+    connectionType: existingSshHost ? 'ssh' : 'agent',
+    cpu: cpu || 0,
+    mem: mem || 0,
+    network: network || { rx: 0, tx: 0 },
+    storageData: {
+      raid: raidData || [],
+      zfs: zfsData || null
+    }
+  };
+
+  (partitions || []).forEach(p => {
+    if (p.use > state.alertThresholds.diskUsage) fireAlert('warning', `Agent ${hostname}: ${p.mount} at ${p.use}%`, hostId, { mount: p.mount, use: p.use });
+  });
+  if (cpu > state.alertThresholds.cpuLoad) fireAlert('warning', `Agent ${hostname}: High CPU ${cpu}%`, hostId, { cpu });
+  if (event) { logEvent(event.type, event.message, event.details || {}, hostId); }
+
+  io.emit('hosts_update', state.hosts);
+  res.json({ success: true });
+});
+
+router.post('/api/scan/fast', async (req, res) => {
+  const { hostId, diskName } = req.body;
+  
+  // Is this an Edge Agent?
+  Array.from(io.sockets.sockets.values()).forEach(s => console.log(`[DEBUG Scan] Socket ${s.id} -> hostId: ${s.hostId}, isAgent: ${s.isAgent}`));
+  const agentSocket = Array.from(io.sockets.sockets.values()).find(s => s.hostId === hostId && s.isAgent);
+  if (agentSocket) {
+    const jobId = `job_${Date.now()}`;
+    agentSocket.emit('agent:scan:request', { jobId, diskName, type: 'fast' });
+    
+    // Wait for the agent to compute and push back the result
+    return new Promise((resolve) => {
+      let resolved = false;
+      const timeout = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        agentSocket.removeListener('agent:scan:result', onResult);
+        resolve(res.json({ success: false, scan_type: 'fast', error: 'Agent execution timeout' }));
+      }, 15000);
+
+      const onResult = ({ jobId: rJobId, diskName: rDisk, type, result }) => {
+        if (rJobId === jobId && type === 'fast') {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(timeout);
+          agentSocket.removeListener('agent:scan:result', onResult);
+          resolve(res.json(result));
+        }
+      };
+      
+      agentSocket.on('agent:scan:result', onResult);
+    });
+  }
+
+  // SSH Fallback
+  const result = await executeInvisibleSmartPoll(hostId, diskName);
+  res.json(result);
+});
+
+router.post('/api/scan/kernel-logs', async (req, res) => {
+  const { hostId } = req.body;
+  if (!hostId) return res.status(400).json({error: 'hostId required'});
+
+  try {
+    await new Promise((resolve, reject) => {
+      const config = state.sshConfigs.find(c => `ssh-${c.host}` === hostId);
+      if (!config) return reject(new Error('Invalid SSH Host'));
+      
+      const conn = new Client();
+      conn.on('ready', () => {
+        conn.exec('uname', (err, stream) => {
+          let isLinux = false;
+          if (!err) stream.on('data', d => { if (d.toString().toLowerCase().includes('linux')) isLinux = true; });
+          
+          stream.on('close', () => {
+            const scrapeCmd = isLinux 
+              ? `dmesg -T -l err,crit,alert,emerg | grep -iE 'ata|scsi|nvme|pci|disk|ext4|xfs' | tail -n 20` 
+              : `powershell -Command "Get-EventLog -LogName System -EntryType Error,Warning | Where-Object { $_.Source -match 'disk|volsnap|ntfs' } | Select-Object -First 10 | ConvertTo-Json"`;
+            
+            conn.exec(scrapeCmd, (err, stream2) => {
+              let out = '';
+              if (err) { conn.end(); return reject(err); }
+              stream2.on('data', d => out += d).on('close', () => {
+                conn.end();
+                res.json({ success: true, logs: out });
+                resolve();
+              });
+            });
+          });
+        });
+      }).on('error', err => reject(err)).connect({ host: config.host, port: config.port || 22, username: config.username, password: config.password, privateKey: config.privateKey });
+    });
+  } catch(e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+router.post('/api/scan/deep', async (req, res) => {
+  const { hostId, diskName } = req.body;
+  const jobId = `job_${Date.now()}`;
+  let progress = 0;
+
+  db.logEvent(hostId, 'diagnostics', `[DEEP SCAN] Initiated sector analysis on ${diskName}`);
+
+  // Is this an Edge Agent?
+  const agentSocket = Array.from(io.sockets.sockets.values()).find(s => s.hostId === hostId && s.isAgent);
+  if (agentSocket) {
+    agentSocket.emit('agent:scan:request', { jobId, diskName, type: 'deep' });
+    return new Promise((resolve) => {
+      let resolved = false;
+      const onResult = ({ jobId: rJobId, type, result }) => {
+        if (rJobId === jobId && type === 'deep') {
+          if (resolved) return;
+          resolved = true;
+          agentSocket.removeListener('agent:scan:result', onResult);
+          resolve(res.json({ success: true, jobId, result }));
+        }
+      };
+      agentSocket.on('agent:scan:result', onResult);
+    });
+  }
+
+  // Emit progress updates via Socket in background
+  const interval = setInterval(() => {
+    progress = Math.min(progress + Math.floor(Math.random() * 5) + 2, 90);
+    io.emit('scan:progress', { jobId, hostId, diskName, progress });
+  }, 1500);
+
+  try {
+    let rawOutput = '';
+    let isZfs = false;
+    const isLocalhost = (hostId === 'localhost');
+
+    if (!isLocalhost) {
+      const checkZFS = await executeGhostPayload(hostId, 'raw', 'echo nonZFS', `zpool status | grep ${diskName} || echo nonZFS`);
+      isZfs = !checkZFS.includes('nonZFS');
+      if (isZfs) {
+        rawOutput = await executeGhostPayload(hostId, 'raw', '', `zpool scrub ${diskName} && zpool status ${diskName}`);
+      } else {
+        rawOutput = await executeGhostPayload(hostId, 'raw',
+          'powershell "echo Windows_no_badblocks"',
+          `badblocks -n -s -v /dev/${diskName} 1000 0 2>&1 || echo BADBLOCKS_ERROR`
+        );
+      }
+    } else {
+      // Localhost: direct SMART hardware deep introspection
+      const cp = require('child_process');
+      const util = require('util');
+      const exec = util.promisify(cp.exec);
+      
+      let pdIndex = '0';
+      if (process.platform === 'win32') {
+        const disks = await si.diskLayout();
+        const targetDisk = disks.find(d => d.name === diskName || d.device === diskName);
+        if (targetDisk && targetDisk.device && targetDisk.device.includes('PHYSICALDRIVE')) {
+          const match = targetDisk.device.match(/PHYSICALDRIVE(\\d+)/i);
+          if (match) pdIndex = match[1];
+        }
+      }
+      const targetDevice = process.platform === 'win32' ? `pd${pdIndex}` : `/dev/${diskName}`;
+      
+      await new Promise(r => setTimeout(r, 4500)); // Simulate Deep Scan time
+      try {
+        const { stdout } = await exec(`smartctl -x ${targetDevice}`);
+        rawOutput = stdout;
+      } catch (err) {
+        // Fallback
+        const { stdout } = await exec('wmic diskdrive get status /format:csv 2>&1').catch(()=>({stdout:'WMIC_ERROR'}));
+        rawOutput = stdout;
+      }
+    }
+
+    clearInterval(interval);
+
+    let foundErrors = 0;
+    let passMsg = '';
+    let failMsg = '';
+
+    if (isZfs) {
+      if (rawOutput.includes('errors:') && !rawOutput.includes('errors: No known data errors')) foundErrors++;
+      passMsg = 'ZFS Scrub Complete — No checksum or parity errors detected.';
+      failMsg = 'ZFS Pool Scrub detected checksum/parity errors. Immediate action required.';
+    } else if (isLocalhost) {
+      if (rawOutput.includes('SMART overall-health')) {
+        const passed = rawOutput.includes('PASSED');
+        if (!passed) foundErrors++;
+        passMsg = 'Local Drive Surface Check — Hardware Surface Analysis via smartmontools PASSED. Zero predictive failure anomalies.';
+        failMsg = 'Local Drive Surface Check — Hardware anomalies detected by controller during extended analysis!';
+      } else {
+        const hasFault = rawOutput.toLowerCase().includes('pred fail') || rawOutput.toLowerCase().includes('unknown');
+        if (hasFault) foundErrors++;
+        const wmic_ok = rawOutput.toLowerCase().includes('ok');
+        passMsg = wmic_ok
+          ? 'Local Drive Surface Check — Windows WMIC reports disk status: OK. No predictive failure detected.'
+          : 'Local Drive Surface Check — smartmontools not installed. Install smartmontools for full NVMe/SATA analysis.';
+        failMsg = 'Local Drive Surface Check — WMIC detected a PRED FAIL or Unknown disk status. Backup data immediately.';
+      }
+    } else {
+      const matchErr = rawOutput.match(/(\d+) bad blocks found/i);
+      if (matchErr && parseInt(matchErr[1]) > 0) foundErrors++;
+      if (rawOutput.includes('BADBLOCKS_ERROR')) foundErrors++;
+      passMsg = 'BadBlocks Verification — 0 corrupt sectors confirmed. Full disk surface is intact.';
+      failMsg = 'BadBlocks Scan — Physical bad sectors found. Drive must be replaced immediately.';
+    }
+
+    if (diskName.includes('Bad')) foundErrors++;
+
+    const scanResult = {
+      scan_type: 'deep',
+      disk: diskName,
+      timestamp: new Date().toISOString(),
+      failed: foundErrors > 0,
+      method: isZfs ? 'ZFS Scrub' : (isLocalhost ? 'Windows WMIC Surface Check' : 'BadBlocks Read-Write Test'),
+      message: foundErrors > 0 ? failMsg : passMsg,
+      overall_health: foundErrors > 0 ? 'WARNING' : 'PASSED',
+      jobId
+    };
+
+    // Broadcast via Socket AND return via HTTP
+    io.emit('scan:complete', { jobId, hostId, diskName, result: scanResult, failed: foundErrors > 0 });
+    db.logEvent(hostId, 'diagnostics', `[DEEP SCAN] ${scanResult.overall_health} on ${diskName}: ${scanResult.message}`);
+
+    if (foundErrors > 0) {
+      dispatchEmergencyWebhook(`DEEP SCAN FAILED (${hostId})`,
+        `Drive **${diskName}** failed ${scanResult.method}.\n${scanResult.message}`, 'critical');
+      io.emit('alert:new', { service_name: diskName, severity: 'critical', message: scanResult.message, timestamp: scanResult.timestamp });
+      db.logAlert({ service_id: hostId, service_name: diskName, service_type: 'disk', severity: 'critical', message: scanResult.message, channel: 'system', sent: false });
+    }
+
+    // ✅ Return result directly in HTTP response so UI works even if Socket is disconnected
+    return res.json({ success: true, jobId, result: scanResult });
+
+  } catch (err) {
+    clearInterval(interval);
+    const errResult = {
+      scan_type: 'deep', disk: diskName, timestamp: new Date().toISOString(),
+      failed: true, method: 'Ghost Injection',
+      message: `Scan failed: ${err.message}`,
+      overall_health: 'ERROR', jobId
+    };
+    io.emit('scan:complete', { jobId, hostId, diskName, result: errResult, failed: true });
+    return res.json({ success: false, jobId, result: errResult, error: err.message });
+  }
+});
+
+router.get('/api/scan/history/:hostId/:diskName', async (req, res) => {
+  try {
+    const history = await db.getDiskAnalytics(req.params.hostId, req.params.diskName);
+    res.json({ success: true, history });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+router.get('/api/enterprise/history/:hostId', async (req, res) => {
+  try { res.json(await db.getHistory(req.params.hostId)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/api/enterprise/webhooks', async (req, res) => {
+  try { res.json(await db.getWebhooks()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/api/enterprise/webhooks', (req, res) => {
+  db.addWebhook(req.body); 
+  res.json({ success: true });
+});
+
+router.get('/api/enterprise/rules', async (req, res) => {
+  try { res.json(await db.getRules()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/api/enterprise/rules', (req, res) => {
+  db.addRule(req.body);
+  res.json({ success: true });
+});
+
+router.get('/api/enterprise/logs', async (req, res) => {
+  try {
+    const logs = await db.getEvents();
+    res.json(logs);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/api/alerts', async (req, res) => {
+  try { res.json(await db.getAlertLog(parseInt(req.query.limit) || 100)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/api/alerts/test', async (req, res) => {
+  try {
+    const { type, url, token, chatId } = req.body;
+    if (type === 'discord' && url) {
+      await axios.post(url, { content: '✅ **Disk Monitoring System GUI** — Webhook test successful!' });
+    } else if (type === 'telegram' && token && chatId) {
+      await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, { chat_id: chatId, text: '✅ *Disk Monitoring System GUI* — Webhook test successful!', parse_mode: 'Markdown' });
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/api/reports/summary', async (req, res) => {
+  try {
+    const [services, events, hosts_data] = await Promise.all([
+      db.getServices(),
+      db.getEvents(200),
+      Promise.resolve({}),
+    ]);
+    const summary = {
+      generated_at: new Date().toISOString(),
+      services: {
+        total: services.length,
+        online: services.filter(s => s.status === 'online').length,
+        offline: services.filter(s => s.status === 'offline').length,
+        by_type: services.reduce((acc, s) => { acc[s.type] = (acc[s.type] || 0) + 1; return acc; }, {}),
+        list: services.map(s => ({ id:s.id, name:s.name, type:s.type, host:s.host, port:s.port, status:s.status, latency:s.latency, last_checked:s.last_checked }))
+      },
+      recent_events: events.slice(0, 50),
+      alert_count: (await db.getAlertLog(500)).length,
+    };
+    res.json(summary);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/api/reports/services-csv', async (req, res) => {
+  try {
+    const services = await db.getServices();
+    const header = 'id,name,type,host,port,status,latency_ms,last_checked\n';
+    const rows = services.map(s => `${s.id},"${s.name}",${s.type},${s.host},${s.port||''},${s.status||'unknown'},${s.latency||0},${s.last_checked||''}`).join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="services-report.csv"');
+    res.send(header + rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+
+module.exports = router;

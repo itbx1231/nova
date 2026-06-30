@@ -1,0 +1,22 @@
+{
+  "name": "edge-agent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "esbuild agent.js --bundle --platform=node --target=node18 --outfile=dist/bundle.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.4.1",
+    "socket.io-client": "^4.8.3",
+    "systeminformation": "^5.31.5"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
+}

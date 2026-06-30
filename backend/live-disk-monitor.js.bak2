@@ -1,0 +1,3814 @@
+/* Nova TelemetryHub — Live Disk Intelligence v3.0
+ * Pure vanilla JS IIFE. No external deps. Served at GET /live-disk-monitor.js
+ * Injected into index.html via <script src="/live-disk-monitor.js">
+ */
+(function () {
+  'use strict';
+
+  // ── Constants ──────────────────────────────────────────────────────────────
+  const RING = 60;
+  const SCAN_PHASES = [
+    'INITIALIZING DIAGNOSTICS',
+    'READING SMART ATTRIBUTES',
+    'SURFACE VERIFICATION',
+    'SECTOR INTEGRITY CHECK',
+    'FILESYSTEM ANALYSIS',
+    'I/O STRESS PROFILING',
+    'COMPILING RESULTS'
+  ];
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  const scans      = {};   // deep scan state per diskName
+  const fastPanels = {};   // fast scan panel DOM refs per diskName
+  const panels     = {};   // deep scan panel DOM refs per diskName
+  const hostRings  = {};   // IO ring buffers per hostId
+  const logBuf     = [];   // global log buffer (capped at LOG_MAX)
+  const LOG_MAX    = 10000;
+  const logFilters = {};   // per-disk active filter string
+  const logPaused  = {};   // per-disk pause bool
+  const logSearch  = {};   // per-disk search string
+  const overlays   = {};   // per-disk backdrop overlay refs
+  let   sock           = null;
+  let   watchedHostId  = null;
+
+  // ── Connection resilience state ───────────────────────────────────────────
+  const conn = {
+    state: 'idle',           // idle|connecting|open|stale|reconnecting|dead
+    lastBeat: 0,
+    lastLatency: 0,
+    rttRing: new Float32Array(60),
+    rttHead: 0,
+    rttCount: 0,
+    reconnectAttempts: 0,
+    reconnectTimer: null,
+    heartbeatTimer: null,
+    staleTimer: null,
+    pingSentAt: 0,
+    packetLossPct: 0,
+    staleSince: null,
+    evtCountWindow: [],       // {ts} entries, last 5s, for evt/s rate
+    lastProgressByJob: {},    // jobId → last progress %, for loss detection
+  };
+
+  // ── Alert engine state ────────────────────────────────────────────────────
+  const alerts = {
+    queue: [],          // {id,sev,source,msg,ts,ackd,count,lastTs}
+    bySig: new Map(),
+    nextId: 1,
+    cooldownMs: 30000,
+    open: false,
+  };
+
+  // ── Prefs ────────────────────────────────────────────────────────────────
+  const prefs = {
+    chromeDisabled: false,
+  };
+
+  // ── Scan Server state ─────────────────────────────────────────────────────
+  const scanServer = {
+    active: false,
+    mode: 'quick',
+    scanning: false,
+    progress: 0,
+    findings: [],
+    history: [],
+    health: null,
+    startTs: null,
+    logFilter: 'ALL',
+    logSearch: '',
+    logScrollLocked: false,
+    logNewCount: 0,
+    _durTimer: null,
+  };
+  const ssLogBuf = [];       // { level, msg, ts, tag }
+  const SS_LOG_MAX = 5000;
+  const SS_LINE_H  = 18;
+
+  // ── CSS ────────────────────────────────────────────────────────────────────
+  function injectCSS() {
+    if (document.getElementById('ndm3-css')) return;
+    const s = document.createElement('style');
+    s.id = 'ndm3-css';
+    s.textContent = `
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+
+@keyframes ndm-fadein  { from { opacity:0; transform:translateY(18px); } to { opacity:1; transform:translateY(0); } }
+@keyframes ndm-fadein-fast { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+@keyframes ndm-pulse   { 0%,100%{opacity:1;} 50%{opacity:.4;} }
+@keyframes ndm-shimmer { 0%{background-position:200% center;} 100%{background-position:-200% center;} }
+@keyframes ndm-glow    { 0%,100%{box-shadow:0 0 8px rgba(34,211,238,.25);} 50%{box-shadow:0 0 22px rgba(34,211,238,.55);} }
+@keyframes ndm-scanline { 0%{left:0;} 100%{left:100%;} }
+@keyframes ndm-card-in { from{opacity:0;transform:translateY(12px);} to{opacity:1;transform:translateY(0);} }
+@keyframes ndm-flash   { 0%,100%{opacity:1;} 50%{opacity:.15;} }
+
+/* Root panels */
+.ndm3,.ndm3-fast,.ndm3-virt {
+  font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace;
+  font-size:12px;
+  color:#cbd5e1;
+  background:rgba(6,11,22,.95);
+  border:1px solid rgba(34,211,238,.18);
+  border-radius:10px;
+  margin-top:14px;
+  padding:18px;
+  animation:ndm-fadein .35s ease-out;
+  position:relative;
+  z-index:10;
+}
+.ndm3 {
+  box-shadow:0 0 28px rgba(34,211,238,.12), 0 4px 40px rgba(0,0,0,.6);
+  animation:ndm-fadein .4s ease-out, ndm-glow 3s ease-in-out infinite;
+}
+.ndm3-fast,.ndm3-virt {
+  box-shadow:0 0 20px rgba(34,197,94,.1), 0 4px 30px rgba(0,0,0,.5);
+}
+.ndm3-virt { border-color:rgba(245,158,11,.25); }
+
+/* Backdrop overlay for deep scan */
+.ndm3-backdrop {
+  position:fixed; inset:0; z-index:9998;
+  background:rgba(2,5,14,.72);
+  backdrop-filter:blur(3px);
+  animation:ndm-fadein-fast .3s ease-out;
+}
+
+/* Close button */
+.ndm3-close {
+  position:absolute; top:12px; right:14px;
+  background:rgba(239,68,68,.12); border:1px solid rgba(239,68,68,.3);
+  color:#ef4444; border-radius:5px; padding:3px 10px;
+  cursor:pointer; font-size:11px; font-family:inherit;
+  transition:background .15s;
+}
+.ndm3-close:hover { background:rgba(239,68,68,.25); }
+
+/* Section label */
+.ndm3-sec {
+  font-size:10px; font-weight:700; letter-spacing:.14em;
+  color:rgba(148,163,184,.6); text-transform:uppercase;
+  margin:18px 0 8px; padding-bottom:5px;
+  border-bottom:1px solid rgba(34,211,238,.08);
+}
+.ndm3-sec:first-child { margin-top:0; }
+
+/* ── Header ── */
+.ndm3-hdr {
+  display:flex; align-items:flex-start; justify-content:space-between;
+  gap:16px; margin-bottom:12px;
+}
+.ndm3-hdr-left { flex:1; min-width:0; }
+.ndm3-title {
+  font-size:13px; font-weight:700; letter-spacing:.08em;
+  color:#22d3ee; text-shadow:0 0 10px rgba(34,211,238,.5);
+  margin-bottom:3px;
+}
+.ndm3-subtitle { font-size:11px; color:#64748b; line-height:1.5; }
+.ndm3-badge {
+  font-size:10px; font-weight:700; letter-spacing:.1em;
+  padding:3px 10px; border-radius:4px; white-space:nowrap;
+}
+.ndm3-badge-live   { background:rgba(34,197,94,.15); border:1px solid rgba(34,197,94,.4); color:#22c55e; animation:ndm-pulse 1.8s ease-in-out infinite; }
+.ndm3-badge-pass   { background:rgba(34,197,94,.15); border:1px solid rgba(34,197,94,.4); color:#22c55e; box-shadow:0 0 10px rgba(34,197,94,.3); }
+.ndm3-badge-warn   { background:rgba(245,158,11,.15); border:1px solid rgba(245,158,11,.4); color:#f59e0b; box-shadow:0 0 10px rgba(245,158,11,.3); }
+.ndm3-badge-crit   { background:rgba(239,68,68,.15); border:1px solid rgba(239,68,68,.4); color:#ef4444; box-shadow:0 0 10px rgba(239,68,68,.3); }
+
+/* ── Progress ── */
+.ndm3-prog-wrap {
+  background:rgba(15,23,42,.8); border:1px solid rgba(34,211,238,.12);
+  border-radius:6px; height:10px; overflow:hidden; margin:10px 0 6px;
+}
+.ndm3-prog-fill {
+  height:100%; border-radius:6px;
+  background:linear-gradient(90deg,#0ea5e9,#22d3ee,#06b6d4,#22d3ee);
+  background-size:200% auto;
+  animation:ndm-shimmer 2.2s linear infinite;
+  transition:width .8s ease;
+  box-shadow:0 0 10px rgba(34,211,238,.5);
+}
+.ndm3-prog-meta { display:flex; gap:18px; font-size:10px; color:#475569; flex-wrap:wrap; }
+.ndm3-prog-meta span { display:flex; gap:5px; align-items:center; }
+.ndm3-prog-meta b   { color:#94a3b8; }
+
+/* ── Metric strips ── */
+.ndm3-strip { display:flex; gap:10px; flex-wrap:wrap; margin:8px 0; }
+.ndm3-chip {
+  background:rgba(15,23,42,.7); border:1px solid rgba(34,211,238,.1);
+  border-radius:6px; padding:7px 12px; display:flex; flex-direction:column;
+  align-items:center; min-width:80px; flex:1;
+  transition:border-color .2s;
+}
+.ndm3-chip:hover { border-color:rgba(34,211,238,.3); }
+.ndm3-chip-lbl { font-size:9px; color:#475569; letter-spacing:.1em; text-transform:uppercase; margin-bottom:3px; }
+.ndm3-chip-val { font-size:16px; font-weight:700; color:#e2e8f0; line-height:1; }
+.ndm3-chip-sub { font-size:9px; margin-top:3px; }
+.ndm3-c-ok   { color:#22c55e; }
+.ndm3-c-warn { color:#f59e0b; }
+.ndm3-c-crit { color:#ef4444; }
+.ndm3-c-cyan { color:#22d3ee; }
+.ndm3-c-ind  { color:#818cf8; }
+.ndm3-c-muted{ color:#475569; }
+
+/* ── Large metric panels (deep scan) ── */
+.ndm3-metric-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin:8px 0; }
+.ndm3-metric-box {
+  background:rgba(10,18,35,.8); border:1px solid rgba(34,211,238,.1);
+  border-radius:8px; padding:12px 14px;
+}
+.ndm3-metric-box-lbl { font-size:9px; color:#475569; letter-spacing:.12em; text-transform:uppercase; }
+.ndm3-metric-box-val { font-size:24px; font-weight:700; color:#e2e8f0; margin:6px 0 4px; line-height:1; }
+.ndm3-metric-box-sub { font-size:10px; }
+
+/* ── Charts ── */
+.ndm3-chart-grid     { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:8px 0; }
+.ndm3-chart-grid-2   { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:8px 0; }
+.ndm3-chart-mini-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin:8px 0; }
+.ndm3-chart-wrap {
+  background:rgba(10,18,35,.8); border:1px solid rgba(34,211,238,.1);
+  border-radius:7px; padding:8px 10px;
+}
+.ndm3-chart-title { font-size:9px; color:#475569; letter-spacing:.1em; text-transform:uppercase; margin-bottom:5px; }
+.ndm3-chart-wrap canvas { display:block; width:100%; }
+
+/* ── Surface Map ── */
+.ndm3-surface-wrap {
+  background:rgba(6,11,22,.9); border:1px solid rgba(34,211,238,.12);
+  border-radius:8px; padding:12px; position:relative; overflow:hidden;
+}
+.ndm3-surface-title { font-size:10px; color:#475569; letter-spacing:.1em; text-transform:uppercase; margin-bottom:8px; }
+.ndm3-surface-wrap canvas { display:block; width:100%; border-radius:4px; }
+.ndm3-surface-scan-line {
+  position:absolute; top:32px; bottom:24px; width:2px;
+  background:linear-gradient(180deg,transparent,rgba(34,211,238,.8),transparent);
+  box-shadow:0 0 8px rgba(34,211,238,.6);
+  pointer-events:none; transition:left .8s linear;
+}
+.ndm3-surface-legend {
+  display:flex; gap:14px; margin-top:8px; flex-wrap:wrap;
+}
+.ndm3-surface-legend span { font-size:10px; color:#64748b; display:flex; align-items:center; gap:5px; }
+.ndm3-surface-legend i {
+  width:10px; height:10px; border-radius:2px; display:inline-block;
+}
+
+/* ── SMART Attribute Cards ── */
+.ndm3-smart-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; margin:8px 0; }
+.ndm3-smart-card {
+  background:rgba(10,18,35,.8); border:1px solid rgba(34,211,238,.1);
+  border-radius:8px; padding:12px 14px; animation:ndm-card-in .35s ease-out both;
+}
+.ndm3-smart-card:nth-child(1){animation-delay:.05s;}
+.ndm3-smart-card:nth-child(2){animation-delay:.10s;}
+.ndm3-smart-card:nth-child(3){animation-delay:.15s;}
+.ndm3-smart-card:nth-child(4){animation-delay:.20s;}
+.ndm3-smart-card:nth-child(5){animation-delay:.25s;}
+.ndm3-smart-card:nth-child(6){animation-delay:.30s;}
+.ndm3-smart-lbl { font-size:9px; color:#475569; letter-spacing:.08em; text-transform:uppercase; margin-bottom:6px; line-height:1.4; }
+.ndm3-smart-val { font-size:22px; font-weight:700; color:#e2e8f0; line-height:1; margin-bottom:6px; }
+.ndm3-smart-status { font-size:10px; display:flex; align-items:center; gap:5px; }
+.ndm3-smart-dot { width:7px; height:7px; border-radius:50%; display:inline-block; }
+
+/* ── AI Ring ── */
+.ndm3-ai-wrap {
+  display:flex; gap:20px; align-items:flex-start;
+  background:rgba(10,18,35,.8); border:1px solid rgba(168,85,247,.18);
+  border-radius:8px; padding:16px; margin:8px 0;
+}
+.ndm3-ai-ring-col { display:flex; flex-direction:column; align-items:center; min-width:140px; }
+.ndm3-ai-ring-col canvas { display:block; }
+.ndm3-ai-score   { font-size:32px; font-weight:700; margin-top:6px; line-height:1; }
+.ndm3-ai-verdict { font-size:11px; font-weight:700; letter-spacing:.1em; margin-top:2px; }
+.ndm3-ai-conf    { font-size:10px; color:#475569; margin-top:4px; }
+.ndm3-ai-body    { flex:1; min-width:0; }
+.ndm3-ai-predict { font-size:11px; margin-bottom:10px; padding:7px 12px; border-radius:5px; background:rgba(168,85,247,.08); border:1px solid rgba(168,85,247,.2); }
+.ndm3-ai-findings { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
+.ndm3-ai-finding  { font-size:10px; color:#94a3b8; display:flex; gap:6px; align-items:flex-start; padding:4px 0; }
+.ndm3-ai-finding-dot { width:6px; height:6px; border-radius:50%; margin-top:3px; flex-shrink:0; }
+.ndm3-ai-rec { font-size:10px; color:#64748b; margin-top:10px; padding-top:8px; border-top:1px solid rgba(34,211,238,.08); line-height:1.6; }
+
+/* ── Problems ── */
+.ndm3-problems { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:8px 0; }
+.ndm3-problem-col { background:rgba(10,18,35,.7); border-radius:7px; padding:10px; }
+.ndm3-problem-col-hdr { font-size:10px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; margin-bottom:8px; padding-bottom:5px; border-bottom:1px solid rgba(255,255,255,.05); }
+.ndm3-problem-hdr-crit { color:#ef4444; }
+.ndm3-problem-hdr-warn { color:#f59e0b; }
+.ndm3-problem-hdr-ok   { color:#22c55e; }
+.ndm3-issue-item { font-size:10px; color:#94a3b8; margin-bottom:6px; display:flex; flex-direction:column; gap:2px; }
+.ndm3-issue-msg  { display:flex; align-items:flex-start; gap:6px; }
+.ndm3-issue-dot  { width:6px; height:6px; border-radius:50%; margin-top:3px; flex-shrink:0; }
+.ndm3-issue-fix  { font-size:9px; color:#475569; margin-left:12px; line-height:1.4; }
+.ndm3-empty-state { font-size:10px; color:#334155; display:flex; align-items:center; gap:6px; padding:6px 0; }
+.ndm3-empty-dot  { width:6px; height:6px; border-radius:50%; background:rgba(34,197,94,.4); animation:ndm-pulse 2s infinite; }
+
+/* ── Log Terminal ── */
+.ndm3-log-toolbar {
+  display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap;
+}
+.ndm3-log-filters { display:flex; gap:4px; flex-wrap:wrap; flex:1; }
+.ndm3-log-filter {
+  font-size:10px; padding:3px 8px; border-radius:4px; cursor:pointer;
+  background:rgba(15,23,42,.6); border:1px solid rgba(34,211,238,.12); color:#64748b;
+  font-family:inherit; transition:all .15s;
+}
+.ndm3-log-filter.active {
+  background:rgba(34,211,238,.12); border-color:rgba(34,211,238,.4); color:#22d3ee;
+}
+.ndm3-log-btn {
+  font-size:10px; padding:3px 9px; border-radius:4px; cursor:pointer;
+  background:rgba(15,23,42,.6); border:1px solid rgba(34,211,238,.18); color:#94a3b8;
+  font-family:inherit; transition:all .15s;
+}
+.ndm3-log-btn:hover { background:rgba(34,211,238,.1); color:#22d3ee; }
+.ndm3-log-btn.paused { border-color:rgba(245,158,11,.4); color:#f59e0b; }
+.ndm3-log-search {
+  font-size:10px; padding:3px 8px; border-radius:4px;
+  background:rgba(15,23,42,.6); border:1px solid rgba(34,211,238,.18); color:#94a3b8;
+  font-family:inherit; outline:none; width:120px;
+}
+.ndm3-log-search:focus { border-color:rgba(34,211,238,.4); color:#e2e8f0; }
+.ndm3-log-box {
+  background:rgba(2,6,18,.95); border:1px solid rgba(34,211,238,.1);
+  border-radius:6px; height:200px; overflow-y:auto; padding:8px 10px;
+  font-family:'JetBrains Mono','Fira Code',monospace; font-size:11px;
+  line-height:1.7; scroll-behavior:smooth;
+}
+.ndm3-log-box::-webkit-scrollbar { width:4px; }
+.ndm3-log-box::-webkit-scrollbar-track { background:transparent; }
+.ndm3-log-box::-webkit-scrollbar-thumb { background:rgba(34,211,238,.2); border-radius:2px; }
+.ndm3-log-line { display:flex; gap:8px; align-items:flex-start; }
+.ndm3-log-ts   { color:#334155; flex-shrink:0; }
+.ndm3-log-tag  { flex-shrink:0; font-weight:700; min-width:48px; }
+.ndm3-log-msg  { color:#94a3b8; word-break:break-word; }
+.ndm3-log-ok   .ndm3-log-tag { color:#22c55e; }
+.ndm3-log-info .ndm3-log-tag { color:#22d3ee; }
+.ndm3-log-warn .ndm3-log-tag { color:#f59e0b; }
+.ndm3-log-error .ndm3-log-tag{ color:#ef4444; }
+
+/* ── Topology ── */
+.ndm3-tree { font-size:11px; line-height:1.9; }
+.ndm3-tree-row { display:flex; align-items:center; gap:8px; padding:1px 0; }
+.ndm3-tree-prefix { color:#334155; flex-shrink:0; font-size:11px; }
+.ndm3-tree-name { color:#e2e8f0; font-weight:500; }
+.ndm3-tree-meta { color:#475569; font-size:10px; }
+.ndm3-tree-bar-wrap { flex:1; max-width:100px; background:rgba(15,23,42,.8); border-radius:3px; height:4px; overflow:hidden; }
+.ndm3-tree-bar      { height:100%; border-radius:3px; transition:width .4s ease; }
+.ndm3-tree-pct      { font-size:10px; color:#475569; min-width:30px; text-align:right; }
+
+/* ── Virt panel specifics ── */
+.ndm3-virt-banner {
+  display:flex; align-items:center; gap:12px; padding:12px 14px;
+  background:rgba(168,85,247,.08); border:1px solid rgba(168,85,247,.25);
+  border-radius:7px; margin-bottom:12px;
+}
+.ndm3-virt-banner-icon { font-size:22px; }
+.ndm3-virt-banner-title { font-size:13px; font-weight:700; color:#a855f7; text-shadow:0 0 10px rgba(168,85,247,.4); }
+.ndm3-virt-banner-sub   { font-size:10px; color:#7c3aed; margin-top:2px; }
+.ndm3-virt-checks { display:grid; grid-template-columns:1fr 1fr; gap:5px; margin:8px 0; }
+.ndm3-virt-check { font-size:10px; display:flex; align-items:center; gap:8px; padding:6px 10px; background:rgba(34,197,94,.06); border:1px solid rgba(34,197,94,.15); border-radius:5px; }
+.ndm3-virt-check-dot { width:7px; height:7px; border-radius:50%; background:#22c55e; box-shadow:0 0 6px rgba(34,197,94,.6); flex-shrink:0; }
+.ndm3-virt-check-off { background:rgba(71,85,105,.06); border-color:rgba(71,85,105,.2); }
+.ndm3-virt-check-off .ndm3-virt-check-dot { background:#334155; box-shadow:none; }
+
+/* ── Responsive ── */
+@media(max-width:900px){
+  .ndm3-metric-grid { grid-template-columns:repeat(2,1fr); }
+  .ndm3-chart-grid,.ndm3-chart-grid-2,.ndm3-chart-mini-grid { grid-template-columns:repeat(2,1fr); }
+  .ndm3-smart-grid  { grid-template-columns:repeat(2,1fr); }
+  .ndm3-problems    { grid-template-columns:1fr; }
+  .ndm3-ai-wrap     { flex-direction:column; }
+  .ndm3-ai-findings { grid-template-columns:1fr; }
+}
+@media(max-width:600px){
+  .ndm3-metric-grid { grid-template-columns:1fr 1fr; }
+  .ndm3-chart-grid,.ndm3-chart-grid-2,.ndm3-chart-mini-grid { grid-template-columns:1fr; }
+  .ndm3-strip       { gap:6px; }
+}
+
+/* ════════════════════════════════════════════════════════════════════════ */
+/* ═══ NOVA SCAN SERVER — full-page overlay styles                     ═══ */
+/* ════════════════════════════════════════════════════════════════════════ */
+
+@keyframes ndm-ss-scan-sweep { 0%{transform:translateX(-100%);} 100%{transform:translateX(400%);} }
+@keyframes ndm-ss-finding-in { from{opacity:0;transform:translateX(14px);} to{opacity:1;transform:translateX(0);} }
+@keyframes ndm-ss-progress    { 0%{background-position:200% center;} 100%{background-position:-200% center;} }
+
+.ndm-ss-overlay {
+  position:fixed; inset:0; z-index:9990;
+  background:#04070f;
+  display:flex; flex-direction:column;
+  font-family:'JetBrains Mono','Fira Code',ui-monospace,Menlo,monospace;
+  color:#cbd5e1; font-size:12px;
+  animation:ndm-fadein .25s ease-out;
+  overflow:hidden;
+}
+.ndm-ss-overlay.hidden { display:none; }
+
+/* ── Top command bar ── */
+.ndm-ss-topbar {
+  flex-shrink:0; height:52px;
+  display:flex; align-items:center; gap:14px; padding:0 20px;
+  background:linear-gradient(180deg,rgba(4,7,15,1) 0%,rgba(8,14,28,.85) 100%);
+  border-bottom:1px solid rgba(34,211,238,.25);
+  box-shadow:0 4px 24px rgba(0,0,0,.6);
+}
+.ndm-ss-title {
+  font-size:14px; font-weight:700; letter-spacing:.2em;
+  background:linear-gradient(90deg,#22d3ee,#818cf8);
+  -webkit-background-clip:text; background-clip:text; color:transparent;
+}
+.ndm-ss-title::before { content:'◈ '; color:#22d3ee; -webkit-text-fill-color:#22d3ee; }
+.ndm-ss-topbar-status {
+  display:inline-flex; align-items:center; gap:7px;
+  padding:5px 12px; border-radius:5px;
+  background:rgba(8,14,28,.7); border:1px solid rgba(56,189,248,.2);
+  font-size:11px; letter-spacing:.08em;
+}
+.ndm-ss-topbar-status.idle    { color:#64748b; border-color:rgba(100,116,139,.3); }
+.ndm-ss-topbar-status.scanning{ color:#22d3ee; border-color:rgba(34,211,238,.45); animation:ndm-pulse 1.6s infinite; }
+.ndm-ss-topbar-status.complete{ color:#22c55e; border-color:rgba(34,197,94,.4); }
+.ndm-ss-topbar-status.critical{ color:#ef4444; border-color:rgba(239,68,68,.55); box-shadow:0 0 14px rgba(239,68,68,.3); }
+.ndm-ss-topbar-status.warning { color:#f59e0b; border-color:rgba(245,158,11,.45); }
+.ndm-ss-health-chip {
+  padding:4px 12px; border-radius:5px; font-size:11px; font-weight:700; letter-spacing:.1em;
+}
+.ndm-ss-health-chip.HEALTHY  { background:rgba(34,197,94,.12); color:#22c55e; border:1px solid rgba(34,197,94,.35); }
+.ndm-ss-health-chip.WARNING  { background:rgba(245,158,11,.12); color:#f59e0b; border:1px solid rgba(245,158,11,.4); }
+.ndm-ss-health-chip.CRITICAL { background:rgba(239,68,68,.12); color:#ef4444; border:1px solid rgba(239,68,68,.45); box-shadow:0 0 12px rgba(239,68,68,.3); }
+.ndm-ss-host-chip {
+  font-size:10.5px; color:#818cf8; padding:4px 10px;
+  border:1px solid rgba(129,140,248,.3); border-radius:5px; background:rgba(129,140,248,.07);
+}
+.ndm-ss-dur { font-size:10.5px; color:#475569; }
+.ndm-ss-close {
+  margin-left:auto; background:transparent; border:1px solid rgba(56,189,248,.22);
+  color:#94a3b8; padding:6px 14px; font-size:11px; border-radius:5px; cursor:pointer;
+  font-family:inherit; transition:all .15s; letter-spacing:.08em;
+}
+.ndm-ss-close:hover { color:#22d3ee; border-color:#22d3ee; box-shadow:0 0 12px rgba(34,211,238,.3); }
+
+/* ── Mode selector + progress bar ── */
+.ndm-ss-controls {
+  flex-shrink:0; padding:10px 20px;
+  background:rgba(4,7,15,.9); border-bottom:1px solid rgba(56,189,248,.1);
+  display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+}
+.ndm-ss-modes { display:flex; gap:6px; }
+.ndm-ss-mode-btn {
+  padding:6px 14px; border-radius:5px; font-size:11px; font-weight:600; letter-spacing:.08em;
+  border:1px solid rgba(56,189,248,.2); background:rgba(8,14,28,.7); color:#64748b;
+  cursor:pointer; font-family:inherit; transition:all .15s;
+}
+.ndm-ss-mode-btn:hover  { color:#22d3ee; border-color:rgba(34,211,238,.45); }
+.ndm-ss-mode-btn.active { color:#04070f; background:#22d3ee; border-color:#22d3ee; box-shadow:0 0 14px rgba(34,211,238,.45); }
+.ndm-ss-scan-btn {
+  padding:7px 20px; border-radius:5px; font-size:12px; font-weight:700; letter-spacing:.12em;
+  border:none; background:linear-gradient(90deg,#22d3ee,#818cf8);
+  color:#04070f; cursor:pointer; font-family:inherit; transition:all .15s;
+  box-shadow:0 0 18px rgba(34,211,238,.35);
+}
+.ndm-ss-scan-btn:hover { box-shadow:0 0 28px rgba(34,211,238,.6); transform:translateY(-1px); }
+.ndm-ss-scan-btn:disabled { opacity:.5; cursor:not-allowed; transform:none; }
+.ndm-ss-progress-wrap {
+  flex:1; min-width:180px; display:flex; align-items:center; gap:10px;
+}
+.ndm-ss-progress-bar {
+  flex:1; height:6px; background:rgba(15,23,42,.9); border-radius:4px; overflow:hidden;
+  border:1px solid rgba(56,189,248,.15);
+}
+.ndm-ss-progress-fill {
+  height:100%; border-radius:4px;
+  background:linear-gradient(90deg,#22d3ee 0%,#818cf8 50%,#22d3ee 100%);
+  background-size:200% auto;
+  transition:width .4s ease;
+}
+.ndm-ss-progress-fill.active { animation:ndm-ss-progress 2s linear infinite; }
+.ndm-ss-progress-pct  { font-size:11px; color:#22d3ee; min-width:32px; text-align:right; font-weight:600; }
+.ndm-ss-progress-step { font-size:10px; color:#475569; min-width:80px; }
+
+/* ── 3-column body layout ── */
+.ndm-ss-body {
+  flex:1; display:grid;
+  grid-template-columns:220px 1fr 280px;
+  grid-template-rows:1fr;
+  overflow:hidden;
+  min-height:0;
+}
+.ndm-ss-left {
+  border-right:1px solid rgba(56,189,248,.1);
+  overflow-y:auto; padding:14px;
+  display:flex; flex-direction:column; gap:12px;
+  background:rgba(4,7,15,.6);
+}
+.ndm-ss-center {
+  overflow-y:auto; padding:14px;
+  display:flex; flex-direction:column; gap:12px;
+}
+.ndm-ss-right {
+  border-left:1px solid rgba(56,189,248,.1);
+  overflow-y:auto; padding:14px;
+  display:flex; flex-direction:column; gap:12px;
+  background:rgba(4,7,15,.6);
+}
+
+/* ── Bottom log terminal ── */
+.ndm-ss-bottom {
+  flex-shrink:0; height:220px;
+  border-top:1px solid rgba(34,211,238,.18);
+  display:flex; flex-direction:column;
+  background:rgba(2,5,12,.97);
+}
+.ndm-ss-term-hdr {
+  flex-shrink:0; display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+  padding:6px 12px; border-bottom:1px solid rgba(56,189,248,.1);
+  background:rgba(4,7,15,.95);
+}
+.ndm-ss-term-title { font-size:10px; color:#22d3ee; letter-spacing:.15em; margin-right:6px; }
+.ndm-ss-flt {
+  padding:3px 9px; font-size:9.5px; border-radius:4px; cursor:pointer;
+  border:1px solid rgba(56,189,248,.18); background:rgba(8,14,28,.7); color:#64748b;
+  font-family:inherit; letter-spacing:.06em; transition:all .12s;
+}
+.ndm-ss-flt:hover  { color:#22d3ee; border-color:rgba(34,211,238,.4); }
+.ndm-ss-flt.active { color:#04070f; background:#22d3ee; border-color:#22d3ee; }
+.ndm-ss-term-search {
+  margin-left:auto; padding:3px 9px; border-radius:4px; font-size:10px;
+  background:rgba(8,14,28,.8); border:1px solid rgba(56,189,248,.18);
+  color:#cbd5e1; font-family:inherit; width:120px; outline:none;
+}
+.ndm-ss-term-search:focus { border-color:#22d3ee; }
+.ndm-ss-log-virt {
+  flex:1; position:relative; overflow:auto;
+  scrollbar-width:thin; scrollbar-color:rgba(34,211,238,.2) transparent;
+}
+.ndm-ss-log-virt::-webkit-scrollbar { width:5px; }
+.ndm-ss-log-virt::-webkit-scrollbar-thumb { background:rgba(34,211,238,.2); border-radius:3px; }
+.ndm-ss-log-spacer { position:relative; }
+.ndm-ss-log-row {
+  position:absolute; left:0; right:0; height:18px; line-height:18px;
+  padding:0 10px; font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.ndm-ss-log-row .ts  { color:#334155; margin-right:6px; }
+.ndm-ss-log-row .tag { color:#22d3ee; margin-right:6px; font-weight:600; }
+.ndm-ss-log-row.ok,.ndm-ss-log-row.info { color:#94a3b8; }
+.ndm-ss-log-row.warn { color:#fde68a; }
+.ndm-ss-log-row.error,.ndm-ss-log-row.crit { color:#fca5a5; }
+.ndm-ss-log-row mark { background:rgba(245,158,11,.35); color:#fde68a; padding:0 2px; border-radius:2px; }
+.ndm-ss-log-jump {
+  position:absolute; bottom:6px; right:12px;
+  background:rgba(34,211,238,.18); color:#22d3ee; border:1px solid rgba(34,211,238,.45);
+  padding:3px 10px; font-size:9.5px; border-radius:12px; cursor:pointer;
+  font-family:inherit; display:none;
+}
+.ndm-ss-log-jump.show { display:inline-block; }
+
+/* ── Left panel blocks ── */
+.ndm-ss-block {
+  background:rgba(8,14,28,.6); border:1px solid rgba(56,189,248,.12);
+  border-radius:7px; padding:10px 12px;
+}
+.ndm-ss-block-hdr {
+  font-size:9.5px; font-weight:700; letter-spacing:.16em; color:#22d3ee;
+  margin-bottom:8px; text-shadow:0 0 8px rgba(34,211,238,.3);
+}
+.ndm-ss-stat-row {
+  display:flex; justify-content:space-between; align-items:center;
+  padding:4px 0; border-bottom:1px solid rgba(56,189,248,.06); font-size:10.5px;
+}
+.ndm-ss-stat-row:last-child { border-bottom:none; }
+.ndm-ss-stat-lbl { color:#64748b; }
+.ndm-ss-stat-val { color:#e2e8f0; font-weight:600; }
+.ndm-ss-stat-val.crit { color:#ef4444; text-shadow:0 0 8px rgba(239,68,68,.5); }
+.ndm-ss-stat-val.warn { color:#f59e0b; }
+.ndm-ss-stat-val.ok   { color:#22c55e; text-shadow:0 0 6px rgba(34,197,94,.4); }
+.ndm-ss-cat-checks { display:flex; flex-direction:column; gap:3px; }
+.ndm-ss-cat-row { display:flex; align-items:center; gap:8px; font-size:10.5px; color:#64748b; padding:3px 0; }
+.ndm-ss-cat-row.active { color:#22d3ee; }
+.ndm-ss-cat-dot { width:6px; height:6px; border-radius:50%; background:#334155; flex-shrink:0; }
+.ndm-ss-cat-dot.active { background:#22d3ee; box-shadow:0 0 6px rgba(34,211,238,.7); }
+.ndm-ss-cat-dot.done   { background:#22c55e; box-shadow:0 0 6px rgba(34,197,94,.5); }
+
+/* ── Findings cards ── */
+.ndm-ss-findings-hdr {
+  display:flex; gap:10px; padding:0 2px; margin-bottom:2px;
+}
+.ndm-ss-count-chip {
+  display:inline-flex; align-items:center; gap:6px;
+  padding:5px 12px; border-radius:5px; font-size:11px; font-weight:700;
+  background:rgba(8,14,28,.7); border:1px solid rgba(56,189,248,.15);
+  color:#64748b;
+}
+.ndm-ss-count-chip.crit { border-color:rgba(239,68,68,.45); color:#fca5a5; background:rgba(239,68,68,.07); }
+.ndm-ss-count-chip.warn { border-color:rgba(245,158,11,.4); color:#fbbf24; background:rgba(245,158,11,.06); }
+.ndm-ss-count-chip.ok   { border-color:rgba(34,197,94,.35); color:#86efac; background:rgba(34,197,94,.06); }
+.ndm-ss-finding {
+  background:rgba(8,14,28,.7); border:1px solid rgba(56,189,248,.14);
+  border-radius:8px; padding:12px 14px; display:flex; gap:12px;
+  animation:ndm-ss-finding-in .25s ease-out;
+}
+.ndm-ss-finding.sev-critical { border-color:rgba(239,68,68,.45); background:rgba(239,68,68,.06); }
+.ndm-ss-finding.sev-warning  { border-color:rgba(245,158,11,.4); background:rgba(245,158,11,.05); }
+.ndm-ss-finding.sev-success  { border-color:rgba(34,197,94,.35); background:rgba(34,197,94,.05); }
+.ndm-ss-finding.sev-info     { border-color:rgba(34,211,238,.25); }
+.ndm-ss-finding-bar { width:3px; flex-shrink:0; border-radius:2px; background:#22d3ee; }
+.ndm-ss-finding.sev-critical .ndm-ss-finding-bar { background:#ef4444; box-shadow:0 0 8px rgba(239,68,68,.7); }
+.ndm-ss-finding.sev-warning  .ndm-ss-finding-bar { background:#f59e0b; }
+.ndm-ss-finding.sev-success  .ndm-ss-finding-bar { background:#22c55e; box-shadow:0 0 6px rgba(34,197,94,.5); }
+.ndm-ss-finding-body { flex:1; min-width:0; }
+.ndm-ss-finding-meta { display:flex; gap:8px; font-size:9.5px; color:#475569; letter-spacing:.07em; text-transform:uppercase; margin-bottom:4px; }
+.ndm-ss-finding-meta b { color:#94a3b8; }
+.ndm-ss-finding-conf { display:inline-block; padding:1px 7px; font-size:9px; border-radius:9px; background:rgba(34,211,238,.1); color:#22d3ee; }
+.ndm-ss-finding-msg  { font-size:11.5px; color:#e2e8f0; line-height:1.5; margin-bottom:4px; font-weight:500; }
+.ndm-ss-finding-fix  { font-size:10px; color:#64748b; }
+.ndm-ss-finding-fix::before { content:'→ '; color:#475569; }
+.ndm-ss-empty { padding:32px 14px; text-align:center; color:#334155; font-size:12px; }
+.ndm-ss-empty-icon { font-size:32px; margin-bottom:10px; }
+
+/* ── Right panel: AI engine ── */
+.ndm-ss-ai-gauge-wrap { display:flex; flex-direction:column; align-items:center; padding:12px 0; }
+.ndm-ss-ai-gauge-wrap canvas { width:120px; height:120px; }
+.ndm-ss-ai-verdict { font-size:13px; font-weight:700; color:#22d3ee; margin-top:8px; letter-spacing:.1em; }
+.ndm-ss-ai-conf    { font-size:10px; color:#64748b; margin-top:2px; }
+.ndm-ss-ai-stream  { display:flex; flex-direction:column; gap:4px; }
+.ndm-ss-ai-item {
+  display:flex; gap:8px; align-items:flex-start; padding:6px 8px;
+  background:rgba(8,14,28,.5); border:1px solid rgba(56,189,248,.1);
+  border-radius:5px; font-size:10.5px; animation:ndm-stream-slide .2s ease-out;
+}
+.ndm-ss-ai-item .ndm-ss-finding-bar { width:3px; flex-shrink:0; border-radius:2px; }
+.ndm-ss-ai-item.sev-critical .ndm-ss-finding-bar { background:#ef4444; }
+.ndm-ss-ai-item.sev-warning  .ndm-ss-finding-bar { background:#f59e0b; }
+.ndm-ss-ai-item.sev-success  .ndm-ss-finding-bar { background:#22c55e; }
+.ndm-ss-ai-item-body { min-width:0; }
+.ndm-ss-ai-item-cat  { font-size:9px; color:#475569; letter-spacing:.1em; text-transform:uppercase; }
+.ndm-ss-ai-item-msg  { color:#cbd5e1; margin-top:1px; }
+
+/* ── Scheduler selector ── */
+.ndm-ss-sched-sel {
+  background:rgba(8,14,28,.85); border:1px solid rgba(56,189,248,.2); color:#64748b;
+  font-size:10px; font-family:inherit; padding:4px 8px; border-radius:5px; cursor:pointer;
+  outline:none; transition:border-color .15s;
+}
+.ndm-ss-sched-sel:focus { border-color:rgba(56,189,248,.5); color:#94a3b8; }
+
+/* ── Scan history panel ── */
+.ndm-ss-history-list { display:flex; flex-direction:column; gap:3px; margin-top:4px; }
+.ndm-ss-history-empty { font-size:10px; color:#334155; text-align:center; padding:6px 0; }
+.ndm-ss-history-row {
+  display:grid; grid-template-columns:52px 52px 58px 46px 14px;
+  gap:3px; align-items:center; padding:5px 6px; border-radius:5px; cursor:pointer;
+  font-size:9.5px; background:rgba(8,14,28,.5); border:1px solid rgba(56,189,248,.1);
+  transition:border-color .15s; color:#64748b;
+}
+.ndm-ss-history-row:hover { border-color:rgba(56,189,248,.3); color:#94a3b8; }
+.ndm-ss-history-time  { color:#475569; }
+.ndm-ss-history-mode  { color:#818cf8; text-transform:uppercase; font-size:8.5px; letter-spacing:.08em; }
+.ndm-ss-history-health.crit { color:#ef4444; }
+.ndm-ss-history-health.warn { color:#f59e0b; }
+.ndm-ss-history-health.ok   { color:#22c55e; }
+.ndm-ss-history-counts { color:#475569; font-size:9px; }
+.ndm-ss-history-trend  { color:#818cf8; font-size:11px; }
+.ndm-ss-history-replay-hdr {
+  font-size:9.5px; color:#818cf8; padding:4px 8px; letter-spacing:.08em; text-transform:uppercase;
+  border-bottom:1px solid rgba(56,189,248,.12); margin-bottom:4px;
+}
+.ndm-ss-export-btn {
+  width:100%; margin-top:8px; background:transparent; border:1px solid rgba(34,211,238,.22);
+  color:#22d3ee; padding:6px 12px; font-size:10px; border-radius:5px; cursor:pointer;
+  font-family:inherit; letter-spacing:.08em; transition:all .15s;
+}
+.ndm-ss-export-btn:hover { background:rgba(34,211,238,.08); box-shadow:0 0 10px rgba(34,211,238,.2); }
+
+/* ── Clickable findings ── */
+.ndm-ss-finding { cursor:pointer; }
+.ndm-ss-finding:hover { border-color:rgba(56,189,248,.35); background:rgba(12,20,38,.9); }
+
+/* ── Finding detail modal ── */
+.ndm-ss-modal {
+  position:fixed; inset:0; z-index:10000; display:none; align-items:center; justify-content:center;
+}
+.ndm-ss-modal-backdrop {
+  position:absolute; inset:0; background:rgba(4,7,15,.82); backdrop-filter:blur(6px);
+}
+.ndm-ss-modal-body {
+  position:relative; background:#080e1c; border:1px solid rgba(56,189,248,.3);
+  border-radius:10px; padding:22px 24px; width:min(560px,90vw); max-height:80vh;
+  overflow-y:auto; box-shadow:0 0 60px rgba(34,211,238,.18);
+  animation:ndm-fadein .18s ease-out;
+}
+.ndm-ss-modal-hdr {
+  display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;
+}
+.ndm-ss-modal-hdr-left { display:flex; align-items:center; gap:10px; }
+.ndm-ss-modal-sev { font-size:11px; font-weight:700; letter-spacing:.12em; padding:3px 10px; border-radius:4px; background:rgba(255,255,255,.06); }
+.ndm-ss-modal-cat { font-size:12px; color:#94a3b8; font-weight:600; letter-spacing:.1em; }
+.ndm-ss-modal-close {
+  background:transparent; border:1px solid rgba(56,189,248,.2); color:#64748b;
+  width:26px; height:26px; border-radius:5px; cursor:pointer; font-family:inherit; font-size:13px;
+  display:flex; align-items:center; justify-content:center; transition:all .15s;
+}
+.ndm-ss-modal-close:hover { color:#ef4444; border-color:rgba(239,68,68,.4); }
+.ndm-ss-modal-msg {
+  font-size:14px; color:#e2e8f0; line-height:1.6; padding:12px 0; border-bottom:1px solid rgba(56,189,248,.1);
+}
+.ndm-ss-modal-section {
+  font-size:9px; color:#334155; letter-spacing:.14em; text-transform:uppercase;
+  margin:12px 0 5px;
+}
+.ndm-ss-modal-meta { font-size:11px; color:#64748b; }
+.ndm-ss-modal-fix {
+  background:rgba(4,7,15,.7); border:1px solid rgba(56,189,248,.14); border-radius:6px;
+  padding:12px 14px; font-size:11.5px; color:#22d3ee; font-family:inherit;
+  white-space:pre-wrap; word-break:break-all; margin:0;
+}
+.ndm-ss-modal-copy {
+  margin-top:10px; background:rgba(34,211,238,.08); border:1px solid rgba(34,211,238,.25);
+  color:#22d3ee; padding:6px 14px; font-size:10px; border-radius:5px; cursor:pointer;
+  font-family:inherit; letter-spacing:.08em; transition:all .15s;
+}
+.ndm-ss-modal-copy:hover { background:rgba(34,211,238,.15); }
+.ndm-ss-modal-copy-ok { font-size:10px; color:#22c55e; margin-left:8px; }
+
+@media(max-width:1100px) {
+  .ndm-ss-body { grid-template-columns:180px 1fr 220px; }
+}
+@media(max-width:800px) {
+  .ndm-ss-body { grid-template-columns:1fr; grid-template-rows:auto 1fr auto; }
+  .ndm-ss-left, .ndm-ss-right { display:none; }
+}
+
+/* ════════════════════════════════════════════════════════════════════════ */
+
+/* ── Alert center ── */
+.ndm-alertcenter {
+  position:fixed; top:54px; right:14px; width:380px; max-height:calc(100vh - 70px); z-index:9100;
+  background:rgba(4,7,15,0.97); backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
+  border:1px solid rgba(56,189,248,.28); border-radius:10px;
+  box-shadow:0 24px 80px rgba(0,0,0,.7), 0 0 0 1px rgba(34,211,238,.06) inset;
+  display:none; flex-direction:column; overflow:hidden;
+  font-family:'JetBrains Mono','Fira Code',ui-monospace,Menlo,monospace;
+  animation:ndm-fadein-fast .22s ease-out;
+}
+.ndm-alertcenter.open { display:flex; }
+.ndm-alertcenter-hdr {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:11px 14px; border-bottom:1px solid rgba(56,189,248,.18);
+  font-size:12px; color:#22d3ee; letter-spacing:.12em; font-weight:600;
+}
+.ndm-alertcenter-hdr-actions { display:flex; gap:8px; }
+.ndm-alertcenter-hdr-actions button {
+  background:rgba(34,211,238,.06); border:1px solid rgba(56,189,248,.22); color:#94a3b8;
+  padding:3px 9px; font-size:9.5px; border-radius:4px; cursor:pointer; letter-spacing:.06em;
+  font-family:inherit;
+}
+.ndm-alertcenter-hdr-actions button:hover { color:#22d3ee; border-color:#22d3ee; }
+.ndm-alertcenter-list { overflow:auto; max-height:60vh; padding:6px; }
+.ndm-alert-row {
+  display:flex; gap:10px; padding:9px 10px; margin-bottom:5px;
+  background:rgba(8,14,28,.65); border:1px solid rgba(56,189,248,.12); border-radius:7px;
+  font-size:10.5px; color:#cbd5e1; animation:ndm-stream-slide .25s ease-out;
+}
+.ndm-alert-row.sev-critical { border-color:rgba(239,68,68,.5); background:rgba(239,68,68,.07); }
+.ndm-alert-row.sev-warning  { border-color:rgba(245,158,11,.4); background:rgba(245,158,11,.05); }
+.ndm-alert-row.sev-info     { border-color:rgba(34,211,238,.3); background:rgba(34,211,238,.04); }
+.ndm-alert-row.sev-success  { border-color:rgba(34,197,94,.3); background:rgba(34,197,94,.04); }
+.ndm-alert-row.ackd { opacity:0.42; }
+.ndm-alert-sev-bar { width:3px; flex-shrink:0; border-radius:2px; background:#22d3ee; }
+.ndm-alert-row.sev-critical .ndm-alert-sev-bar { background:#ef4444; box-shadow:0 0 8px rgba(239,68,68,.7); }
+.ndm-alert-row.sev-warning  .ndm-alert-sev-bar { background:#f59e0b; }
+.ndm-alert-row.sev-success  .ndm-alert-sev-bar { background:#22c55e; }
+.ndm-alert-body { flex:1; min-width:0; }
+.ndm-alert-meta { display:flex; gap:8px; font-size:9px; color:#64748b; letter-spacing:.07em; text-transform:uppercase; margin-bottom:3px; }
+.ndm-alert-meta b { color:#94a3b8; font-weight:600; }
+.ndm-alert-msg  { word-break:break-word; line-height:1.45; color:#e2e8f0; }
+.ndm-alert-cnt  { display:inline-block; margin-left:6px; padding:1px 6px; font-size:9px; background:rgba(34,211,238,.15); color:#22d3ee; border-radius:8px; }
+.ndm-alert-ack  { background:transparent; border:1px solid rgba(56,189,248,.22); color:#94a3b8; padding:3px 8px; font-size:9px; border-radius:4px; cursor:pointer; align-self:flex-start; font-family:inherit; }
+.ndm-alert-ack:hover { color:#22d3ee; border-color:#22d3ee; }
+.ndm-alert-empty { padding:24px 14px; text-align:center; color:#64748b; font-size:11px; }
+
+/* ── Sparklines (in metric chips) ── */
+.ndm3-chip { position:relative; }
+.ndm3-chip-spark {
+  width:100%; height:18px; margin-top:5px; opacity:.85;
+  background:linear-gradient(180deg,rgba(34,211,238,0.02),rgba(34,211,238,0.06));
+  border-radius:3px;
+}
+.ndm3-chip-trend { position:absolute; top:6px; right:8px; font-size:9px; letter-spacing:.05em; }
+.ndm3-chip-trend.up   { color:#22c55e; }
+.ndm3-chip-trend.down { color:#ef4444; }
+.ndm3-chip-trend.flat { color:#64748b; }
+
+/* ── Virtualized log scroller ── */
+.ndm3-log-virt {
+  position:relative; overflow:auto;
+  scrollbar-width:thin; scrollbar-color:rgba(34,211,238,.25) transparent;
+}
+.ndm3-log-virt::-webkit-scrollbar { width:6px; height:6px; }
+.ndm3-log-virt::-webkit-scrollbar-thumb { background:rgba(34,211,238,.2); border-radius:3px; }
+.ndm3-log-virt-spacer { position:relative; }
+.ndm3-log-virt-row { position:absolute; left:0; right:0; height:18px; line-height:18px; padding:0 8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:10.5px; font-family:inherit; }
+.ndm3-log-virt-row .ts  { color:#64748b; margin-right:7px; }
+.ndm3-log-virt-row .tag { color:#22d3ee; margin-right:6px; }
+.ndm3-log-virt-row.ok   { color:#a7f3d0; }
+.ndm3-log-virt-row.info { color:#cbd5e1; }
+.ndm3-log-virt-row.warn { color:#fde68a; }
+.ndm3-log-virt-row.error,.ndm3-log-virt-row.crit { color:#fca5a5; }
+.ndm3-log-virt-row mark { background:rgba(245,158,11,.35); color:#fde68a; padding:0 2px; border-radius:2px; }
+.ndm3-log-jump {
+  position:absolute; bottom:8px; right:14px;
+  background:rgba(34,211,238,.18); color:#22d3ee; border:1px solid rgba(34,211,238,.45);
+  padding:4px 10px; font-size:10px; border-radius:14px; cursor:pointer;
+  font-family:inherit; display:none; box-shadow:0 0 14px rgba(34,211,238,.35);
+  letter-spacing:.04em;
+}
+.ndm3-log-jump.show { display:inline-block; }
+
+/* ── Stale data overlay ── */
+.ndm3-panel.stale .ndm3-chart-wrap canvas,
+.ndm3-panel.stale .ndm3-metric-box-val,
+.ndm3-panel.stale .ndm3-chip-val { opacity:0.55; filter:grayscale(0.4); }
+.ndm3-stale-banner {
+  display:none; padding:6px 12px; margin-bottom:10px;
+  background:rgba(245,158,11,.08); border:1px solid rgba(245,158,11,.35);
+  border-radius:6px; font-size:10.5px; color:#fbbf24; letter-spacing:.05em;
+}
+.ndm3-panel.stale .ndm3-stale-banner { display:block; }
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* ═══ INFRASTRUCTURE OVERVIEW BLOCK (top of deep panel)              ═══ */
+/* ═══════════════════════════════════════════════════════════════════════ */
+.ndm3-infra-overview {
+  display:flex; flex-direction:column; gap:0;
+  margin-bottom:18px;
+  border:1px solid rgba(34,211,238,0.2);
+  border-radius:10px;
+  overflow:hidden;
+  background:rgba(4,7,15,0.7);
+  box-shadow:0 0 32px rgba(34,211,238,0.06), 0 2px 24px rgba(0,0,0,0.5);
+}
+.ndm3-infra-block {
+  padding:18px 20px;
+  border-bottom:1px solid rgba(56,189,248,0.1);
+}
+.ndm3-infra-block:last-child { border-bottom:none; }
+.ndm3-infra-hdr {
+  display:flex; align-items:center; gap:10px;
+  font-size:11px; font-weight:700; letter-spacing:.18em;
+  color:#22d3ee; text-shadow:0 0 10px rgba(34,211,238,.35);
+  margin-bottom:14px;
+}
+.ndm3-infra-hdr-icon { font-size:16px; opacity:.8; }
+.ndm3-infra-hdr-disk {
+  margin-left:auto; font-size:12px; font-weight:700;
+  color:#818cf8; background:rgba(129,140,248,.1);
+  padding:3px 10px; border:1px solid rgba(129,140,248,.3);
+  border-radius:5px; letter-spacing:.08em;
+}
+
+/* Large topology tree */
+.ndm3-tree-lg {
+  font-size:13px !important; line-height:2 !important;
+}
+.ndm3-tree-lg .ndm3-tree-row { padding:5px 0 !important; gap:12px !important; }
+.ndm3-tree-lg .ndm3-tree-prefix { font-size:13px !important; }
+.ndm3-tree-lg .ndm3-tree-name { font-size:14px !important; font-weight:700 !important; color:#e2e8f0 !important; }
+.ndm3-tree-lg .ndm3-tree-meta { font-size:12px !important; color:#64748b !important; }
+.ndm3-tree-lg .ndm3-tree-bar-wrap { max-width:160px !important; height:6px !important; border-radius:4px !important; }
+.ndm3-tree-lg .ndm3-tree-bar { height:6px !important; }
+.ndm3-tree-lg .ndm3-tree-pct { font-size:12px !important; color:#94a3b8 !important; }
+
+/* Large LVM flow */
+.ndm3-lvm-flow-lg {
+  margin-top:0 !important;
+}
+.ndm3-lvm-flow-lg .ndm3-lvm-col { min-width:150px !important; }
+.ndm3-lvm-flow-lg .ndm3-lvm-col-hdr { font-size:10px !important; padding-bottom:6px !important; margin-bottom:8px !important; }
+.ndm3-lvm-flow-lg .ndm3-lvm-node { padding:9px 12px !important; }
+.ndm3-lvm-flow-lg .ndm3-lvm-node-name { font-size:13px !important; }
+.ndm3-lvm-flow-lg .ndm3-lvm-node-meta { font-size:11px !important; margin-top:4px !important; }
+.ndm3-lvm-flow-lg .ndm3-lvm-node-bar { height:5px !important; margin-top:7px !important; }
+.ndm3-lvm-flow-lg .ndm3-lvm-arrow { font-size:22px !important; padding:0 8px !important; }
+.ndm3-lvm-empty { font-size:11.5px; color:#475569; padding:8px 0; }
+
+/* Large FS rings grid */
+.ndm3-fs-rings-lg {
+  grid-template-columns:repeat(auto-fill, minmax(130px,1fr)) !important;
+  gap:12px !important;
+}
+.ndm3-fs-rings-lg .ndm3-fs-ring { padding:14px 10px !important; }
+.ndm3-fs-rings-lg .ndm3-fs-ring canvas { width:80px !important; height:80px !important; }
+.ndm3-fs-rings-lg .ndm3-fs-ring-name { font-size:12px !important; margin-top:8px !important; }
+.ndm3-fs-rings-lg .ndm3-fs-ring-meta { font-size:10px !important; margin-top:3px !important; }
+
+/* ── LVM flow diagram ── */
+.ndm3-lvm-flow {
+  display:flex; align-items:stretch; gap:8px; padding:10px;
+  background:rgba(168,85,247,.04); border:1px solid rgba(168,85,247,.18);
+  border-radius:7px; margin-top:8px; overflow-x:auto;
+}
+.ndm3-lvm-col { flex:1; min-width:120px; display:flex; flex-direction:column; gap:5px; }
+.ndm3-lvm-col-hdr { font-size:9px; color:#a855f7; letter-spacing:.14em; text-align:center; padding-bottom:4px; border-bottom:1px solid rgba(168,85,247,.2); margin-bottom:4px; }
+.ndm3-lvm-node {
+  padding:5px 8px; background:rgba(8,14,28,.65); border:1px solid rgba(168,85,247,.25);
+  border-radius:4px; font-size:10px; color:#e2e8f0;
+}
+.ndm3-lvm-node-name { font-weight:600; color:#c4b5fd; }
+.ndm3-lvm-node-meta { font-size:9px; color:#64748b; margin-top:2px; }
+.ndm3-lvm-node-bar  { height:3px; margin-top:4px; background:rgba(168,85,247,.15); border-radius:2px; overflow:hidden; }
+.ndm3-lvm-node-bar-fill { height:100%; background:linear-gradient(90deg,#818cf8,#a855f7); }
+.ndm3-lvm-arrow { display:flex; align-items:center; color:#a855f7; font-size:14px; }
+
+/* ── Filesystem radial usage rings ── */
+.ndm3-fs-rings { display:grid; grid-template-columns:repeat(auto-fill,minmax(110px,1fr)); gap:8px; margin-top:8px; }
+.ndm3-fs-ring  { display:flex; flex-direction:column; align-items:center; padding:8px; background:rgba(8,14,28,.6); border:1px solid rgba(56,189,248,.14); border-radius:6px; }
+.ndm3-fs-ring canvas { width:64px; height:64px; }
+.ndm3-fs-ring-name { font-size:10px; color:#cbd5e1; margin-top:4px; font-weight:600; max-width:96px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ndm3-fs-ring-meta { font-size:9px; color:#64748b; margin-top:1px; }
+`;
+    document.head.appendChild(s);
+  }
+
+  // ── Ring Buffer ────────────────────────────────────────────────────────────
+  function makeRing(hostId) {
+    hostRings[hostId] = {
+      rkBs: new Float32Array(RING), wkBs: new Float32Array(RING),
+      rAwait: new Float32Array(RING), wAwait: new Float32Array(RING),
+      util: new Float32Array(RING), rIops: new Float32Array(RING),
+      wIops: new Float32Array(RING), aqu: new Float32Array(RING),
+      temp: new Float32Array(RING), head: 0, count: 0
+    };
+    return hostRings[hostId];
+  }
+
+  function pushRing(hostId, ioStats, tempC) {
+    const r = hostRings[hostId] || makeRing(hostId);
+    let rkBs=0,wkBs=0,rAwait=0,wAwait=0,util=0,rIops=0,wIops=0,aqu=0,n=0;
+    (ioStats||[]).forEach(d => {
+      if (!d.device || /^(loop|sr)/.test(d.device)) return;
+      rkBs += (d.rkB_s||0); wkBs += (d.wkB_s||0);
+      rAwait += (d.r_await||0); wAwait += (d.w_await||0);
+      util += (d.pct_util||0); rIops += (d.r_s||0); wIops += (d.w_s||0);
+      aqu += (d['aqu-sz']||d.aqu_sz||0); n++;
+    });
+    if (n>1){ rAwait/=n; wAwait/=n; util/=n; aqu/=n; }
+    const h = r.head;
+    r.rkBs[h]=rkBs; r.wkBs[h]=wkBs; r.rAwait[h]=rAwait; r.wAwait[h]=wAwait;
+    r.util[h]=util; r.rIops[h]=rIops; r.wIops[h]=wIops; r.aqu[h]=aqu;
+    r.temp[h] = (tempC||0);
+    r.head = (h+1) % RING;
+    r.count = Math.min(r.count+1, RING);
+    return {rkBs,wkBs,rAwait,wAwait,util,rIops,wIops,aqu};
+  }
+
+  function orderedRing(arr, head, count) {
+    const n = count || RING;
+    const out = new Float32Array(n);
+    for (let i=0;i<n;i++) out[i] = arr[(head - n + i + RING) % RING];
+    return out;
+  }
+
+  // ── Canvas Chart Engine ────────────────────────────────────────────────────
+  function drawChart(cv, series, colors, opts) {
+    if (!cv) return;
+    opts = opts||{};
+    const dpr = window.devicePixelRatio||1;
+    const W = cv.offsetWidth||200, H = cv.offsetHeight||80;
+    cv.width = W*dpr; cv.height = H*dpr;
+    const ctx = cv.getContext('2d');
+    ctx.scale(dpr,dpr);
+    ctx.clearRect(0,0,W,H);
+
+    // background
+    ctx.fillStyle = 'rgba(6,11,22,.0)';
+    ctx.fillRect(0,0,W,H);
+
+    // grid lines
+    ctx.strokeStyle = 'rgba(34,211,238,.06)';
+    ctx.lineWidth = 1;
+    [.25,.5,.75].forEach(f => {
+      const y = Math.round(H*f)+.5;
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke();
+    });
+
+    // optional threshold line
+    if (opts.threshold != null) {
+      const maxVal = opts.max || 1;
+      const ty = H - (opts.threshold/maxVal)*H;
+      ctx.setLineDash([3,4]);
+      ctx.strokeStyle = 'rgba(245,158,11,.35)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0,ty); ctx.lineTo(W,ty); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    if (!series || series.length===0) return;
+
+    // compute global max
+    let maxVal = opts.max != null ? opts.max : 1;
+    if (opts.max == null) {
+      series.forEach(s => s.forEach(v => { if (v>maxVal) maxVal=v; }));
+      if (maxVal===0) maxVal=1;
+    }
+
+    // label
+    if (opts.label && maxVal>0) {
+      ctx.fillStyle = 'rgba(148,163,184,.35)';
+      ctx.font = `${Math.round(8*dpr)/dpr}px JetBrains Mono,monospace`;
+      ctx.fillText(fmtNum(maxVal), 3, 10);
+    }
+
+    // draw series
+    series.forEach((data, si) => {
+      const color = colors[si] || '#22d3ee';
+      const n = data.length;
+      if (n < 2) return;
+      const pts = data.map((v,i) => ({
+        x: (i/(n-1))*W,
+        y: H - Math.max(0,Math.min(1,(v/maxVal)))*H*0.92
+      }));
+
+      // fill gradient
+      ctx.shadowBlur = 0;
+      const grad = ctx.createLinearGradient(0,0,0,H);
+      grad.addColorStop(0, color.replace(')',',0.25)').replace('rgb','rgba'));
+      grad.addColorStop(1, 'rgba(6,11,22,0)');
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, H);
+      pts.forEach(p => ctx.lineTo(p.x, p.y));
+      ctx.lineTo(pts[pts.length-1].x, H);
+      ctx.closePath();
+      ctx.fillStyle = grad;
+      ctx.fill();
+
+      // line with glow
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 4;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      pts.forEach((p,i) => i===0 ? ctx.moveTo(p.x,p.y) : ctx.lineTo(p.x,p.y));
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    });
+  }
+
+  // ── Health Arc Ring ────────────────────────────────────────────────────────
+  function drawHealthRing(cv, score, opts) {
+    if (!cv) return;
+    opts = opts||{};
+    const dpr = window.devicePixelRatio||1;
+    const size = opts.size||120;
+    cv.width = cv.height = size*dpr;
+    cv.style.width = cv.style.height = size+'px';
+    const ctx = cv.getContext('2d');
+    ctx.scale(dpr,dpr);
+    const cx=size/2, cy=size/2, r=size/2-8;
+    const start = Math.PI*0.75, end = Math.PI*2.25;
+    const fill  = start + (end-start)*(Math.min(100,score)/100);
+    const color = score<30 ? '#22c55e' : score<60 ? '#f59e0b' : '#ef4444';
+
+    // track
+    ctx.strokeStyle = 'rgba(30,41,59,.8)';
+    ctx.lineWidth   = 10;
+    ctx.lineCap     = 'round';
+    ctx.beginPath(); ctx.arc(cx,cy,r,start,end); ctx.stroke();
+
+    // fill
+    if (score>0) {
+      ctx.shadowColor = color; ctx.shadowBlur = 14;
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = 10;
+      ctx.beginPath(); ctx.arc(cx,cy,r,start,fill); ctx.stroke();
+      ctx.shadowBlur  = 0;
+    }
+
+    // score text
+    ctx.fillStyle = color;
+    ctx.font = `bold ${opts.scoreFontSize||20}px JetBrains Mono,monospace`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(score, cx, cy-4);
+
+    // label
+    if (opts.label) {
+      ctx.fillStyle = 'rgba(148,163,184,.6)';
+      ctx.font = `${opts.labelFontSize||9}px JetBrains Mono,monospace`;
+      ctx.fillText(opts.label, cx, cy+12);
+    }
+  }
+
+  // ── Surface Health Map ─────────────────────────────────────────────────────
+  const SURF_COLS=80, SURF_ROWS=20; // 1600 cells
+  const UNSCANNED=0, HEALTHY=1, SLOW=2, UNSTABLE=3, BAD=4;
+
+  function initSurface(state) {
+    state.surface = new Uint8Array(SURF_COLS*SURF_ROWS);
+    state.scanLine = 0;
+  }
+
+  function updateSurface(state, progress, rAwait) {
+    const filled = Math.floor((progress/100)*SURF_COLS*SURF_ROWS);
+    for (let i=0; i<filled; i++) {
+      if (state.surface[i]!==BAD) {
+        if (rAwait > 100) state.surface[i] = UNSTABLE;
+        else if (rAwait > 40) state.surface[i] = SLOW;
+        else state.surface[i] = HEALTHY;
+      }
+    }
+    state.scanLine = (filled / (SURF_COLS*SURF_ROWS)) * SURF_COLS;
+  }
+
+  function markBadSectors(state, count) {
+    const n = Math.min(count*3, 30);
+    for (let i=0;i<n;i++) {
+      const idx = Math.floor(Math.random()*SURF_COLS*SURF_ROWS);
+      state.surface[idx] = BAD;
+    }
+  }
+
+  function drawSurface(cv, state) {
+    if (!cv) return;
+    const dpr = window.devicePixelRatio||1;
+    const W = cv.offsetWidth||600, H = 80;
+    cv.width = W*dpr; cv.height = H*dpr;
+    cv.style.height = H+'px';
+    const ctx = cv.getContext('2d');
+    ctx.scale(dpr,dpr);
+    ctx.fillStyle = '#060b16';
+    ctx.fillRect(0,0,W,H);
+
+    const cw = W/SURF_COLS, ch = H/SURF_ROWS;
+    const COLORS = ['#0f1a2e','#22d3ee','#f59e0b','#f97316','#ef4444'];
+    for (let r=0;r<SURF_ROWS;r++) {
+      for (let c=0;c<SURF_COLS;c++) {
+        const v = state.surface[r*SURF_COLS+c];
+        ctx.fillStyle = COLORS[v];
+        ctx.fillRect(c*cw+.5, r*ch+.5, cw-.5, ch-.5);
+      }
+    }
+  }
+
+  // ── Storage Topology ───────────────────────────────────────────────────────
+  function buildTopology(diskName, diskInfo, partitions, lvm) {
+    const rows = [];
+    const di = diskInfo || {};
+    rows.push({ depth:0, prefix:'', name: diskName.toUpperCase(),
+                meta: [(di.model||di.type||''), di.size||''].filter(Boolean).join('  ·  '),
+                pct:null });
+    const parts = (partitions||[]).filter(p =>
+      p.device && (p.device.includes(diskName) || (di.name && p.device.includes(di.name)))
+    );
+    parts.forEach((p,i) => {
+      const last = i===parts.length-1 && !(lvm&&lvm.lvs&&lvm.lvs.length);
+      const pct  = parseInt(p.use_percent||'0')||0;
+      rows.push({ depth:1, prefix: last?'└─':'├─',
+                  name: (p.device||'').replace('/dev/mapper/','').replace('/dev/',''),
+                  meta: [p.fstype||'', p.mountpoint||'', p.size||''].filter(Boolean).join('  '),
+                  pct });
+      if (lvm && lvm.lvs) {
+        const vols = lvm.lvs.filter(lv => lv.vg_name && p.device && p.device.includes(lv.vg_name));
+        vols.forEach((lv,li) => {
+          rows.push({ depth:2, prefix:li===vols.length-1?'    └─':'    ├─',
+                      name: lv.lv_name||'', meta: ['LVM', lv.lv_size||''].join('  '),
+                      pct: null });
+        });
+      }
+    });
+    return rows;
+  }
+
+  function renderTopology(el, rows) {
+    if (!el) return;
+    el.innerHTML = '';
+    rows.forEach(row => {
+      const d = document.createElement('div');
+      d.className = 'ndm3-tree-row';
+      const barColor = row.pct==null ? '' : row.pct>=90?'#ef4444':row.pct>=70?'#f59e0b':'#22d3ee';
+      d.innerHTML =
+        `<span class="ndm3-tree-prefix">${esc(row.prefix)}</span>` +
+        `<span class="ndm3-tree-name">${esc(row.name)}</span>` +
+        `<span class="ndm3-tree-meta">${esc(row.meta)}</span>` +
+        (row.pct!=null ? `<div class="ndm3-tree-bar-wrap"><div class="ndm3-tree-bar" style="width:${row.pct}%;background:${barColor}"></div></div><span class="ndm3-tree-pct">${row.pct}%</span>` : '');
+      el.appendChild(d);
+    });
+  }
+
+  // ── AI Scoring ─────────────────────────────────────────────────────────────
+  function computeAI(result, ring) {
+    let risk=0;
+    const findings=[], positives=[];
+    const r = result||{};
+
+    // SMART health
+    const sh = (r.smart && r.smart.health) || r.overall_health || r.overallStatus || 'PASSED';
+    if (sh==='PASSED'||sh==='OK') positives.push('SMART health: PASSED');
+    else { risk+=30; findings.push({c:'crit', t:'SMART health check FAILED'}); }
+
+    // Bad sectors
+    const bs = r.badSectors||0;
+    if (bs>0) { risk+=Math.min(40,bs*12); findings.push({c:'crit', t:`Bad sectors: ${bs}`}); }
+    else positives.push('No bad sectors detected');
+
+    // Reallocated sectors attr 5
+    const attrs = (r.smart&&r.smart.attributes)||[];
+    const a5 = attrs.find(a=>String(a.id)==='5'||a.name==='Reallocated_Sector_Ct');
+    const rv5 = (a5&&(a5.raw_value||a5.rawValue||0))||r.reallocated||0;
+    if (rv5>0) { risk+=15; findings.push({c:'warn', t:`Reallocated sectors: ${rv5}`}); }
+    else positives.push('No reallocated sectors');
+
+    // Pending sectors attr 197
+    const a197 = attrs.find(a=>String(a.id)==='197'||a.name==='Current_Pending_Sector');
+    const rv197 = (a197&&(a197.raw_value||a197.rawValue||0))||0;
+    if (rv197>0) { risk+=20; findings.push({c:'warn', t:`Pending sectors: ${rv197}`}); }
+
+    // IO errors
+    if (r.ioErrors>0) { risk+=10; findings.push({c:'warn', t:`I/O errors: ${r.ioErrors}`}); }
+
+    // Latency from ring
+    if (ring) {
+      const avgLat = ring.rAwait.reduce((a,v)=>a+v,0)/RING;
+      if (avgLat>30) { risk+=10; findings.push({c:'warn', t:`Avg read latency: ${avgLat.toFixed(1)}ms`}); }
+      else if (avgLat>10) positives.push(`Read latency: ${avgLat.toFixed(1)}ms`);
+      const avgUtil = ring.util.reduce((a,v)=>a+v,0)/RING;
+      if (avgUtil>85) { risk+=8; findings.push({c:'warn', t:`High utilization: ${avgUtil.toFixed(0)}%`}); }
+    }
+
+    // Temperature
+    const temp = r.temperature||0;
+    if (temp>60) { risk+=15; findings.push({c:'crit', t:`Temperature critical: ${temp}°C`}); }
+    else if (temp>50) { risk+=8; findings.push({c:'warn', t:`Temperature elevated: ${temp}°C`}); }
+    else if (temp>0)  positives.push(`Temperature normal: ${temp}°C`);
+
+    risk = Math.min(100, Math.round(risk));
+    const verdict = risk<25?'HEALTHY':risk<50?'LOW RISK':risk<75?'ELEVATED RISK':'HIGH RISK';
+    const verdictCls = risk<25?'ndm3-c-ok':risk<50?'ndm3-c-cyan':risk<75?'ndm3-c-warn':'ndm3-c-crit';
+    const conf = Math.max(55, 88 - findings.length*3);
+
+    let rec = '';
+    if (risk>=75) rec = 'Immediate action required — backup data and replace disk.';
+    else if (risk>=50) rec = 'Schedule disk replacement. Run deep scan weekly.';
+    else if (risk>=25) rec = 'Monitor SMART attributes. Run full scan monthly.';
+    else rec = 'Disk healthy. Continue periodic monitoring.';
+
+    return {risk, verdict, verdictCls, conf, findings, positives, rec};
+  }
+
+  // ── Problem Detection ──────────────────────────────────────────────────────
+  function buildProblems(result, ioAnomaly) {
+    const crits=[], warns=[], oks=[];
+    const r = result||{};
+    const failed = r.failed||false;
+    if (failed) crits.push({msg:'Scan detected hardware faults', fix:'Run diagnostics, backup immediately'});
+    if (r.badSectors>0) crits.push({msg:`Bad sectors: ${r.badSectors}`, fix:'Replace disk immediately — data at risk'});
+    const sh = (r.smart&&r.smart.health)||r.overall_health||'PASSED';
+    if (sh!=='PASSED'&&sh!=='OK') crits.push({msg:`SMART health: ${sh}`, fix:'Backup data now, plan replacement'});
+    if (r.ioErrors>0) warns.push({msg:`I/O errors: ${r.ioErrors}`, fix:'Check controller and cables'});
+    if (ioAnomaly) {
+      if (ioAnomaly.latency>80) crits.push({msg:`Latency spike: ${ioAnomaly.latency.toFixed(0)}ms`, fix:'Check I/O queue depth and competing workloads'});
+      else if (ioAnomaly.latency>30) warns.push({msg:`Elevated latency: ${ioAnomaly.latency.toFixed(0)}ms`, fix:'Monitor for patterns'});
+      if (ioAnomaly.util>90) warns.push({msg:`High utilization: ${ioAnomaly.util.toFixed(0)}%`, fix:'Review I/O workloads'});
+    }
+    const temp = r.temperature||0;
+    if (temp>60) crits.push({msg:`Temperature critical: ${temp}°C`, fix:'Improve airflow immediately'});
+    else if (temp>50) warns.push({msg:`Temperature elevated: ${temp}°C`, fix:'Improve cooling'});
+    else if (temp>0) oks.push({msg:`Temperature: ${temp}°C — normal`});
+    const method = r.method||'';
+    if (method) {
+      if (!failed) oks.push({msg:`${method}: PASSED`});
+    }
+    if (!failed && !r.badSectors) oks.push({msg:'No hardware faults detected'});
+    if ((r.smart&&r.smart.health==='PASSED')||r.overall_health==='PASSED') oks.push({msg:'SMART health: PASSED'});
+    return {crits, warns, oks};
+  }
+
+  // ── Log Stream ────────────────────────────────────────────────────────────
+  function extractTag(msg) {
+    const m = msg.match(/^\[([A-Z\/0-9]+)\]/);
+    return m ? m[1] : 'OTHER';
+  }
+
+  function appendLog(panel, diskName, level, msg, tsMs) {
+    const entry = {level, msg, ts: tsMs||Date.now(), tag: extractTag(msg), disk: diskName};
+    logBuf.push(entry);
+    if (logBuf.length>300) logBuf.shift();
+
+    if (!panel) return;
+    if (logPaused[diskName]) return;
+
+    const filter  = logFilters[diskName]||'ALL';
+    const search  = (logSearch[diskName]||'').toLowerCase();
+    if (filter!=='ALL' && entry.tag!==filter) return;
+    if (search && !msg.toLowerCase().includes(search)) return;
+
+    const box = panel.querySelector('.ndm3-log-box');
+    if (!box) return;
+    const wasBottom = box.scrollHeight - box.clientHeight <= box.scrollTop + 20;
+
+    const line = document.createElement('div');
+    line.className = `ndm3-log-line ndm3-log-${level}`;
+    const d = new Date(entry.ts);
+    const ts = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+    line.innerHTML =
+      `<span class="ndm3-log-ts">[${ts}]</span>` +
+      `<span class="ndm3-log-tag">[${esc(entry.tag)}]</span>` +
+      `<span class="ndm3-log-msg">${esc(msg.replace(/^\[[A-Z\/0-9]+\]\s*/,''))}</span>`;
+    box.appendChild(line);
+    // limit DOM
+    while (box.children.length>200) box.removeChild(box.firstChild);
+    if (wasBottom) box.scrollTop = box.scrollHeight;
+  }
+
+  function rebuildLog(panel, diskName) {
+    if (!panel) return;
+    const box = panel.querySelector('.ndm3-log-box');
+    if (!box) return;
+    const filter = logFilters[diskName]||'ALL';
+    const search = (logSearch[diskName]||'').toLowerCase();
+    box.innerHTML = '';
+    const entries = logBuf.filter(e =>
+      e.disk === diskName &&
+      (filter==='ALL' || e.tag===filter) &&
+      (!search || e.msg.toLowerCase().includes(search))
+    );
+    entries.slice(-150).forEach(e => {
+      const d = new Date(e.ts);
+      const ts = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+      const line = document.createElement('div');
+      line.className = `ndm3-log-line ndm3-log-${e.level}`;
+      line.innerHTML =
+        `<span class="ndm3-log-ts">[${ts}]</span>` +
+        `<span class="ndm3-log-tag">[${esc(e.tag)}]</span>` +
+        `<span class="ndm3-log-msg">${esc(e.msg.replace(/^\[[A-Z\/0-9]+\]\s*/,''))}</span>`;
+      box.appendChild(line);
+    });
+    box.scrollTop = box.scrollHeight;
+  }
+
+  // ── DOM Helper ─────────────────────────────────────────────────────────────
+  function findDiskCard(diskName) {
+    const cards = document.querySelectorAll('.glass-card');
+    const dn = diskName.toLowerCase();
+    for (const c of cards) {
+      const txt = c.textContent.toLowerCase();
+      if (txt.includes(dn)) return c;
+    }
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // PANEL TYPE 1 — FAST SCAN (SMART Available)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  function smartCardStatus(key, val) {
+    const k = key.toLowerCase();
+    const v = parseInt(val)||0;
+    if (k.includes('reallocated')||k.includes('pending')||k.includes('uncorrectable')||k.includes('media error')) {
+      if (v>10) return {cls:'ndm3-c-crit', dot:'#ef4444', label:'CRITICAL'};
+      if (v>0)  return {cls:'ndm3-c-warn', dot:'#f59e0b', label:'WARNING'};
+      return {cls:'ndm3-c-ok', dot:'#22c55e', label:'HEALTHY'};
+    }
+    if (k.includes('temp')) {
+      if (v>60) return {cls:'ndm3-c-crit', dot:'#ef4444', label:'CRITICAL'};
+      if (v>50) return {cls:'ndm3-c-warn', dot:'#f59e0b', label:'WARM'};
+      if (v>0)  return {cls:'ndm3-c-ok',   dot:'#22c55e', label:'NORMAL'};
+      return {cls:'ndm3-c-muted', dot:'#334155', label:'N/A'};
+    }
+    if (k.includes('wear')||k.includes('percent')) {
+      if (v>90) return {cls:'ndm3-c-crit', dot:'#ef4444', label:'CRITICAL'};
+      if (v>70) return {cls:'ndm3-c-warn', dot:'#f59e0b', label:'WORN'};
+      if (v>=0) return {cls:'ndm3-c-ok',   dot:'#22c55e', label:'GOOD'};
+    }
+    return {cls:'ndm3-c-ok', dot:'#22c55e', label:'OK'};
+  }
+
+  function buildFastPanel(diskName, result) {
+    const r = result||{};
+    const health = r.overall_health||r.overallStatus||'PASSED';
+    const isWarn = r.isAtRisk||health==='WARNING';
+    const badgeCls = isWarn ? 'ndm3-badge-warn' : 'ndm3-badge-pass';
+    const badgeTxt = isWarn ? 'WARNING' : 'PASSED';
+
+    // SMART attribute cards
+    const ff = r.fatal_five||{};
+    const smartCards = Object.entries(ff).map(([k,v]) => {
+      const s = smartCardStatus(k,v);
+      const shortKey = k.replace(/^SMART \d+ \(/,'').replace(/NVMe /,'').replace(/\)$/,'');
+      return `<div class="ndm3-smart-card">
+        <div class="ndm3-smart-lbl">${esc(shortKey)}</div>
+        <div class="ndm3-smart-val ${s.cls}">${esc(String(v))}</div>
+        <div class="ndm3-smart-status">
+          <span class="ndm3-smart-dot" style="background:${s.dot};box-shadow:0 0 6px ${s.dot}88"></span>
+          <span class="${s.cls}">${s.label}</span>
+        </div>
+      </div>`;
+    }).join('');
+
+    // predicted days
+    const pd = r.predicted_days;
+    const predictTxt = pd!=null
+      ? (pd<30 ? `⚠ Potential issue predicted in ~${pd} days` : `No failure predicted (trend: stable)`)
+      : 'Insufficient trend data — monitoring...';
+    const predictCls = (pd!=null&&pd<30) ? 'ndm3-c-warn' : 'ndm3-c-ok';
+
+    const diskLabel = [r.diskModel||diskName, r.diskSize, r.diskInterface, r.diskSerial?`S/N:${r.diskSerial}`:null].filter(Boolean).join('  ·  ');
+    const ts = r.timestamp ? new Date(r.timestamp).toLocaleString() : new Date().toLocaleString();
+
+    return `<div class="ndm3-fast" id="ndm-fast-${esc(diskName)}" data-disk="${esc(diskName)}">
+  <button class="ndm3-close" data-ndm-close="fast-${esc(diskName)}">✕ Close</button>
+
+  <div class="ndm3-hdr">
+    <div class="ndm3-hdr-left">
+      <div class="ndm3-title">⚡ FAST STORAGE ANALYSIS</div>
+      <div class="ndm3-subtitle">${esc(diskLabel)}</div>
+      <div class="ndm3-subtitle" style="margin-top:3px">Completed: ${esc(ts)}</div>
+    </div>
+    <span class="ndm3-badge ${badgeCls}">${badgeTxt}</span>
+  </div>
+
+  <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+    <div style="display:flex;flex-direction:column;align-items:center;min-width:140px">
+      <canvas id="cv-ai-fast-${esc(diskName)}" width="140" height="140"></canvas>
+      <div id="ndm-fast-score-${esc(diskName)}" style="font-size:11px;margin-top:6px;text-align:center"></div>
+      <div class="ndm3-ai-predict ${predictCls}" style="margin-top:8px;font-size:10px;text-align:center;max-width:140px;padding:5px 8px;border-radius:5px;background:rgba(168,85,247,.07);border:1px solid rgba(168,85,247,.18)">${esc(predictTxt)}</div>
+    </div>
+    <div style="flex:1;min-width:0">
+      <div class="ndm3-sec">S.M.A.R.T. ATTRIBUTES</div>
+      <div class="ndm3-smart-grid">${smartCards}</div>
+    </div>
+  </div>
+
+  <div class="ndm3-sec">LIVE I/O TELEMETRY</div>
+  <div class="ndm3-strip" id="ndm-fast-strip-${esc(diskName)}">
+    ${mc('frc','Read','-','KB/s','ndm3-c-cyan', diskName)}
+    ${mc('fwc','Write','-','KB/s','ndm3-c-ind', diskName)}
+    ${mc('flat','Latency','-','ms','', diskName)}
+    ${mc('fiops','IOPS','-','ops','', diskName)}
+    ${mc('futil','Utilization','-','%','', diskName)}
+    ${mc('fque','Queue','-','', '', diskName)}
+  </div>
+
+  <div class="ndm3-sec">PERFORMANCE CHARTS</div>
+  <div class="ndm3-chart-mini-grid">
+    ${ch('fcv-thr-'+esc(diskName),'Throughput')}
+    ${ch('fcv-lat-'+esc(diskName),'Latency')}
+    ${ch('fcv-iop-'+esc(diskName),'IOPS')}
+    ${ch('fcv-uti-'+esc(diskName),'Utilization %')}
+    ${ch('fcv-que-'+esc(diskName),'Queue Depth')}
+    ${ch('fcv-thm-'+esc(diskName),'Temperature')}
+  </div>
+
+  <div class="ndm3-sec">DIAGNOSTIC EVENTS</div>
+  <div class="ndm3-log-toolbar">
+    <div class="ndm3-log-filters" id="ndm-fast-filters-${esc(diskName)}">
+      ${logFilter('ALL',true)} ${logFilter('SCAN',false)} ${logFilter('SMART',false)} ${logFilter('I/O',false)} ${logFilter('PREDICT',false)}
+    </div>
+  </div>
+  <div class="ndm3-log-box" id="ndm-fast-log-${esc(diskName)}"></div>
+
+  <div class="ndm3-sec">STORAGE TOPOLOGY</div>
+  <div class="ndm3-tree" id="ndm-fast-tree-${esc(diskName)}"><span class="ndm3-c-muted">Loading topology...</span></div>
+</div>`;
+  }
+
+  function injectFastPanel(diskName, hostId, result) {
+    const existing = document.getElementById('ndm-fast-'+diskName);
+    if (existing) { finalizeFastPanel(diskName, hostId, result); return; }
+    const card = findDiskCard(diskName);
+    if (!card) {
+      let attempts=0;
+      const t = setInterval(()=>{
+        attempts++;
+        const c = findDiskCard(diskName);
+        if (c) { clearInterval(t); _doInjectFast(c, diskName, hostId, result); }
+        else if (attempts>20) clearInterval(t);
+      },250);
+      return;
+    }
+    _doInjectFast(card, diskName, hostId, result);
+  }
+
+  function _doInjectFast(card, diskName, hostId, result) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = buildFastPanel(diskName, result);
+    const panel = wrap.firstElementChild;
+    card.appendChild(panel);
+    fastPanels[diskName] = panel;
+    logFilters[diskName] = 'ALL';
+
+    // wire close
+    panel.querySelector('.ndm3-close').addEventListener('click', () => {
+      panel.remove();
+      delete fastPanels[diskName];
+    });
+
+    // wire log filters
+    const filterBar = panel.querySelector('.ndm3-log-filters');
+    if (filterBar) {
+      filterBar.querySelectorAll('.ndm3-log-filter').forEach(btn => {
+        btn.addEventListener('click', () => {
+          filterBar.querySelectorAll('.ndm3-log-filter').forEach(b=>b.classList.remove('active'));
+          btn.classList.add('active');
+          logFilters[diskName] = btn.dataset.filter;
+          rebuildLog(panel, diskName);
+        });
+      });
+    }
+
+    // draw AI ring
+    finalizeFastPanel(diskName, hostId, result);
+
+    // generate synthetic log events from scan result
+    if (result) _genFastLogs(diskName, result, panel);
+  }
+
+  function finalizeFastPanel(diskName, hostId, result) {
+    const panel = fastPanels[diskName];
+    if (!panel || !result) return;
+    const r = result;
+
+    // AI ring
+    const cv = panel.querySelector(`#cv-ai-fast-${diskName}`);
+    const ai = computeAI(r, hostRings[hostId]);
+    if (cv) drawHealthRing(cv, 100-ai.risk, {size:140, scoreFontSize:26, label: ai.verdict});
+
+    const scoreEl = panel.querySelector(`#ndm-fast-score-${diskName}`);
+    if (scoreEl) {
+      const cls = ai.risk<25?'ndm3-c-ok':ai.risk<50?'ndm3-c-cyan':ai.risk<75?'ndm3-c-warn':'ndm3-c-crit';
+      scoreEl.innerHTML = `<span class="${cls}" style="font-weight:700">${ai.verdict}</span><br><span class="ndm3-c-muted" style="font-size:10px">Confidence: ${ai.conf}%</span>`;
+    }
+
+    // update badge
+    const badge = panel.querySelector('.ndm3-badge');
+    if (badge) {
+      const isWarn = r.isAtRisk||r.overall_health==='WARNING';
+      badge.className = 'ndm3-badge ' + (isWarn?'ndm3-badge-warn':'ndm3-badge-pass');
+      badge.textContent = isWarn ? 'WARNING' : 'PASSED';
+    }
+
+    // update topology
+    const hostData = getHostData(hostId);
+    if (hostData) {
+      const diskInfo = (hostData.disks||[]).find(d=>d.name===diskName)||{};
+      const rows = buildTopology(diskName, diskInfo, hostData.partitions, hostData.lvm);
+      renderTopology(panel.querySelector(`#ndm-fast-tree-${diskName}`), rows);
+    }
+  }
+
+  function _genFastLogs(diskName, result, panel) {
+    const r = result||{};
+    const ff = r.fatal_five||{};
+    const add = (lv,m) => appendLog(panel, diskName, lv, m);
+
+    add('ok',    '[SCAN] Fast storage analysis complete');
+    add(r.overall_health==='PASSED'?'ok':'error', `[SMART] Overall health: ${r.overall_health||'PASSED'}`);
+    if (r.temperature) add((r.temperature>50)?'warn':'ok', `[THERMAL] Temperature: ${r.temperature}°C`);
+
+    Object.entries(ff).forEach(([k,v]) => {
+      const s = smartCardStatus(k,v);
+      const lv = s.label==='CRITICAL'?'error':s.label==='WARNING'?'warn':'info';
+      add(lv, `[SMART] ${k}: ${v}`);
+    });
+
+    if (r.predicted_days!=null) {
+      add(r.predicted_days<30?'warn':'ok', `[PREDICT] ${r.predicted_days<30?`Risk in ~${r.predicted_days} days`:'No failure predicted'}`);
+    } else {
+      add('info','[PREDICT] Insufficient history for trend analysis');
+    }
+    if (r.errorCount===0||!r.isAtRisk) add('ok','[SCAN] No critical issues detected');
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // PANEL TYPE 2 — VIRTUAL / SMART UNAVAILABLE
+  // ══════════════════════════════════════════════════════════════════════════
+
+  function buildVirtPanel(diskName, result) {
+    const r = result||{};
+    const fb = r.fallbackAnalysis||{};
+    const virt = r.virtualization||fb.virtType||null;
+    const virtName = typeof virt==='object' ? virt.type : (virt||'');
+    const envLabels = {kvm:'QEMU/KVM Hypervisor',vmware:'VMware ESXi',
+      'hyper-v':'Microsoft Hyper-V', xen:'Xen Hypervisor'};
+    const envLabel = envLabels[virtName] || (virtName ? virtName.toUpperCase()+' Environment' : 'Virtual Environment');
+
+    const tel = fb.telemetryActive||{};
+    const checks = [
+      {k:'ioLatency',    lbl:'I/O Latency Monitoring'},
+      {k:'throughput',   lbl:'Throughput Analysis'},
+      {k:'queueDepth',   lbl:'Queue Depth Tracking'},
+      {k:'kernelLogs',   lbl:'Kernel Log Monitoring'},
+      {k:'filesystemHealth', lbl:'Filesystem Integrity'},
+      {k:'heuristicAnalysis',lbl:'Heuristic Analysis'},
+      {k:'virtualizationAware',lbl:'Virtualization-Aware'},
+      {k:'smartPassthrough',   lbl:'SMART Passthrough'},
+    ];
+    const checkHtml = checks.map(c => {
+      const on = tel[c.k]===true;
+      return `<div class="ndm3-virt-check${on?'':' ndm3-virt-check-off'}">
+        <span class="ndm3-virt-check-dot"></span>
+        <span style="color:${on?'#94a3b8':'#334155'}">${esc(c.lbl)}</span>
+      </div>`;
+    }).join('');
+
+    const findings = (fb.findings||[]).map(f => {
+      const clr = f.level==='critical'?'#ef4444':f.level==='warning'?'#f59e0b':'#22c55e';
+      return `<div class="ndm3-ai-finding">
+        <span class="ndm3-ai-finding-dot" style="background:${clr}"></span>
+        <span>[${esc(f.category||'')}] ${esc(f.msg||'')}</span>
+      </div>`;
+    }).join('');
+
+    const score = Math.max(0, 100-(fb.riskScore||0));
+    const ts = r.timestamp ? new Date(r.timestamp).toLocaleString() : new Date().toLocaleString();
+
+    return `<div class="ndm3-virt" id="ndm-virt-${esc(diskName)}" data-disk="${esc(diskName)}">
+  <button class="ndm3-close" data-ndm-close="virt-${esc(diskName)}">✕ Close</button>
+
+  <div class="ndm3-virt-banner">
+    <span class="ndm3-virt-banner-icon">🖥</span>
+    <div>
+      <div class="ndm3-virt-banner-title">VIRTUALIZED STORAGE TELEMETRY ACTIVE</div>
+      <div class="ndm3-virt-banner-sub">${esc(envLabel)}  ·  ${esc(diskName)}  ·  ${esc(ts)}</div>
+    </div>
+    <span class="ndm3-badge ndm3-badge-${fb.assessment==='HEALTHY'||!fb.assessment?'pass':'warn'}" style="margin-left:auto">${esc(fb.assessment||'ANALYZED')}</span>
+  </div>
+
+  <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px">
+    <div>
+      <div class="ndm3-sec" style="margin-top:0">TELEMETRY CAPABILITIES</div>
+      <div class="ndm3-virt-checks">${checkHtml}</div>
+    </div>
+    <div style="display:flex;flex-direction:column;align-items:center;min-width:140px">
+      <div class="ndm3-sec" style="margin-top:0;width:100%">AI HEALTH SCORE</div>
+      <canvas id="cv-ai-virt-${esc(diskName)}" width="120" height="120"></canvas>
+      <div style="font-size:10px;color:#475569;margin-top:6px">Confidence: ${fb.confidence||70}%</div>
+    </div>
+  </div>
+
+  <div class="ndm3-sec">LIVE I/O TELEMETRY</div>
+  <div class="ndm3-strip" id="ndm-virt-strip-${esc(diskName)}">
+    ${mc('vrc','Read','-','KB/s','ndm3-c-cyan')}
+    ${mc('vwc','Write','-','KB/s','ndm3-c-ind')}
+    ${mc('vlat','Latency','-','ms','')}
+    ${mc('viops','IOPS','-','ops','')}
+    ${mc('vutil','Util','-','%','')}
+    ${mc('vque','Queue','-','','')}
+  </div>
+
+  <div class="ndm3-sec">PERFORMANCE CHARTS</div>
+  <div class="ndm3-chart-mini-grid">
+    ${ch('vcv-thr-'+esc(diskName),'Throughput')}
+    ${ch('vcv-lat-'+esc(diskName),'Latency')}
+    ${ch('vcv-iop-'+esc(diskName),'IOPS')}
+    ${ch('vcv-uti-'+esc(diskName),'Utilization %')}
+    ${ch('vcv-que-'+esc(diskName),'Queue Depth')}
+    ${ch('vcv-thm-'+esc(diskName),'Temperature')}
+  </div>
+
+  <div class="ndm3-sec">AI DIAGNOSTIC FINDINGS</div>
+  <div class="ndm3-ai-findings" style="margin:8px 0">${findings||'<span class="ndm3-c-muted">No findings data available</span>'}</div>
+
+  ${fb.recommendation?`<div class="ndm3-ai-rec">→ ${esc(fb.recommendation)}</div>`:''}
+
+  <div class="ndm3-sec">DIAGNOSTIC EVENTS</div>
+  <div class="ndm3-log-box" id="ndm-virt-log-${esc(diskName)}" style="height:140px"></div>
+
+  <div class="ndm3-sec">STORAGE TOPOLOGY</div>
+  <div class="ndm3-tree" id="ndm-virt-tree-${esc(diskName)}"><span class="ndm3-c-muted">Loading...</span></div>
+</div>`;
+  }
+
+  function injectVirtPanel(diskName, hostId, result) {
+    const existing = document.getElementById('ndm-virt-'+diskName);
+    if (existing) { existing.remove(); }
+    const card = findDiskCard(diskName);
+    if (!card) {
+      let attempts=0;
+      const t = setInterval(()=>{
+        attempts++;
+        const c = findDiskCard(diskName);
+        if (c) { clearInterval(t); _doInjectVirt(c, diskName, hostId, result); }
+        else if (attempts>20) clearInterval(t);
+      },250);
+      return;
+    }
+    _doInjectVirt(card, diskName, hostId, result);
+  }
+
+  function _doInjectVirt(card, diskName, hostId, result) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = buildVirtPanel(diskName, result);
+    const panel = wrap.firstElementChild;
+    card.appendChild(panel);
+    fastPanels[diskName] = panel;
+
+    panel.querySelector('.ndm3-close').addEventListener('click', () => {
+      panel.remove();
+      delete fastPanels[diskName];
+    });
+
+    // draw AI ring
+    const cv = panel.querySelector(`#cv-ai-virt-${diskName}`);
+    const fb = (result||{}).fallbackAnalysis||{};
+    if (cv) drawHealthRing(cv, Math.max(0,100-(fb.riskScore||0)), {size:120, scoreFontSize:22, label:fb.assessment||'ANALYZED'});
+
+    // topology
+    const hostData = getHostData(hostId);
+    if (hostData) {
+      const diskInfo = (hostData.disks||[]).find(d=>d.name===diskName)||{};
+      renderTopology(panel.querySelector(`#ndm-virt-tree-${diskName}`),
+        buildTopology(diskName, diskInfo, hostData.partitions, hostData.lvm));
+    }
+
+    // generate logs
+    const r = result||{};
+    const add = (lv,m) => appendLog(panel, diskName, lv, m);
+    add('info', '[SCAN] Virtualized storage analysis complete');
+    add('info', `[VIRT] Environment: ${r.virtualization?.type||fb.virtType||'virtual'}`);
+    if (fb.virtMessage) add('info', `[VIRT] ${fb.virtMessage}`);
+    (fb.findings||[]).forEach(f => {
+      const lv = f.level==='critical'?'error':f.level==='warning'?'warn':'ok';
+      add(lv, `[${f.category||'SCAN'}] ${f.msg||''}`);
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // PANEL TYPE 3 — DEEP SCAN
+  // ══════════════════════════════════════════════════════════════════════════
+
+  function activateAnalysisMode(diskName) {
+    if (overlays[diskName]) return;
+    const bd = document.createElement('div');
+    bd.className = 'ndm3-backdrop';
+    bd.id = 'ndm3-backdrop-'+diskName;
+    document.body.appendChild(bd);
+    overlays[diskName] = bd;
+  }
+
+  function deactivateAnalysisMode(diskName) {
+    const bd = overlays[diskName];
+    if (bd) { bd.remove(); delete overlays[diskName]; }
+  }
+
+  function buildDeepPanel(diskName) {
+    const filters = ['ALL','SCAN','SMART','I/O','KERNEL','NVME','FS'];
+    const filterBtns = filters.map((f,i) => logFilter(f, i===0)).join(' ');
+    return `<div class="ndm3" id="ndm-deep-${esc(diskName)}" data-disk="${esc(diskName)}" style="position:relative;z-index:9999">
+  <button class="ndm3-close" data-ndm-close="deep-${esc(diskName)}">✕ Close</button>
+
+  <!-- Header -->
+  <div style="border:1px solid rgba(34,211,238,.2);border-radius:7px;padding:14px 16px;margin-bottom:12px;background:rgba(8,14,28,.8)">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <span class="ndm3-badge ndm3-badge-live" id="ndm-deep-badge-${esc(diskName)}">● SCANNING</span>
+      <span class="ndm3-title" id="ndm-deep-title-${esc(diskName)}">DEEP STORAGE FORENSICS — ${esc(diskName.toUpperCase())}</span>
+    </div>
+    <div class="ndm3-prog-wrap"><div class="ndm3-prog-fill" id="ndm-deep-prog-${esc(diskName)}" style="width:1%"></div></div>
+    <div class="ndm3-prog-meta">
+      <span><b id="ndm-deep-pct-${esc(diskName)}">1</b>%</span>
+      <span>Elapsed: <b id="ndm-deep-ela-${esc(diskName)}">00:00</b></span>
+      <span>ETA: <b id="ndm-deep-eta-${esc(diskName)}">—</b></span>
+      <span>Phase: <b id="ndm-deep-phase-${esc(diskName)}">${SCAN_PHASES[0]}</b></span>
+    </div>
+    <div class="ndm3-prog-meta" style="margin-top:6px">
+      <span>Temp: <b id="ndm-deep-temp-${esc(diskName)}">—</b></span>
+      <span>Load: <b id="ndm-deep-load-${esc(diskName)}">—</b></span>
+      <span>Latency: <b id="ndm-deep-lat-${esc(diskName)}">—</b></span>
+      <span>IOPS: <b id="ndm-deep-iops-${esc(diskName)}">—</b></span>
+    </div>
+  </div>
+
+  <!-- ═══ INFRASTRUCTURE OVERVIEW (top of panel) ═══ -->
+  <div class="ndm3-infra-overview">
+
+    <!-- STORAGE TOPOLOGY -->
+    <div class="ndm3-infra-block">
+      <div class="ndm3-infra-hdr">
+        <span class="ndm3-infra-hdr-icon">▦</span>
+        STORAGE TOPOLOGY
+        <span class="ndm3-infra-hdr-disk" id="ndm-deep-infra-disk-${esc(diskName)}">${esc(diskName.toUpperCase())}</span>
+      </div>
+      <div class="ndm3-tree ndm3-tree-lg" id="ndm-deep-tree-${esc(diskName)}"><span class="ndm3-c-muted">Awaiting telemetry...</span></div>
+    </div>
+
+    <!-- LVM FLOW -->
+    <div class="ndm3-infra-block">
+      <div class="ndm3-infra-hdr">
+        <span class="ndm3-infra-hdr-icon">⇄</span>
+        LVM FLOW · PV → VG → LV
+      </div>
+      <div class="ndm3-lvm-flow ndm3-lvm-flow-lg" id="ndm-deep-lvm-${esc(diskName)}" style="display:none"></div>
+      <div class="ndm3-lvm-empty" id="ndm-deep-lvm-empty-${esc(diskName)}"><span class="ndm3-c-muted">No LVM detected on this disk</span></div>
+    </div>
+
+    <!-- FILESYSTEM USAGE -->
+    <div class="ndm3-infra-block">
+      <div class="ndm3-infra-hdr">
+        <span class="ndm3-infra-hdr-icon">◫</span>
+        FILESYSTEM USAGE
+      </div>
+      <div class="ndm3-fs-rings ndm3-fs-rings-lg" id="ndm-deep-fsrings-${esc(diskName)}"><span class="ndm3-c-muted">Awaiting data...</span></div>
+    </div>
+
+  </div>
+
+  <!-- Large metric panels -->
+  <div class="ndm3-sec">LIVE PERFORMANCE METRICS</div>
+  <div class="ndm3-metric-grid">
+    ${mbox('ndm-m-rthru-'+esc(diskName),'READ THROUGHPUT','-','MB/s','')}
+    ${mbox('ndm-m-wthru-'+esc(diskName),'WRITE THROUGHPUT','-','MB/s','')}
+    ${mbox('ndm-m-rlat-'+esc(diskName),'READ LATENCY','-','ms','')}
+    ${mbox('ndm-m-temp-'+esc(diskName),'TEMPERATURE','-','°C','')}
+  </div>
+  <div class="ndm3-metric-grid" style="margin-top:6px">
+    ${mbox('ndm-m-riops-'+esc(diskName),'READ IOPS','-','ops','')}
+    ${mbox('ndm-m-wiops-'+esc(diskName),'WRITE IOPS','-','ops','')}
+    ${mbox('ndm-m-que-'+esc(diskName),'QUEUE DEPTH','-','','')}
+    ${mbox('ndm-m-util-'+esc(diskName),'UTILIZATION','-','%','')}
+  </div>
+
+  <!-- Surface Map -->
+  <div class="ndm3-sec">SURFACE FORENSICS MAP</div>
+  <div class="ndm3-surface-wrap">
+    <div class="ndm3-surface-title">Sector integrity scan — real-time visualization</div>
+    <div class="ndm3-surface-scan-line" id="ndm-scanline-${esc(diskName)}" style="left:0%"></div>
+    <canvas id="cv-surf-${esc(diskName)}"></canvas>
+    <div class="ndm3-surface-legend">
+      <span><i style="background:#0f1a2e;border:1px solid #334155"></i> Unscanned</span>
+      <span><i style="background:#22d3ee"></i> Healthy</span>
+      <span><i style="background:#f59e0b"></i> Slow (&gt;40ms)</span>
+      <span><i style="background:#f97316"></i> Unstable (&gt;100ms)</span>
+      <span><i style="background:#ef4444"></i> Bad sector</span>
+    </div>
+  </div>
+
+  <!-- Charts -->
+  <div class="ndm3-sec">REALTIME ANALYTICS</div>
+  <div class="ndm3-chart-grid">
+    ${ch('cv-thr-'+esc(diskName),'Throughput  (R=cyan / W=indigo)')}
+    ${ch('cv-lat-'+esc(diskName),'Latency ms  (threshold 30ms)')}
+    ${ch('cv-iop-'+esc(diskName),'IOPS  (R=cyan / W=indigo)')}
+  </div>
+  <div class="ndm3-chart-grid" style="margin-top:8px">
+    ${ch('cv-uti-'+esc(diskName),'Utilization %')}
+    ${ch('cv-que-'+esc(diskName),'Queue Depth')}
+    ${ch('cv-thm-'+esc(diskName),'Thermal °C')}
+  </div>
+
+  <!-- Diagnostic console -->
+  <div class="ndm3-sec">DIAGNOSTIC STREAM</div>
+  <div class="ndm3-log-toolbar">
+    <div class="ndm3-log-filters" id="ndm-deep-filters-${esc(diskName)}">${filterBtns}</div>
+    <button class="ndm3-log-btn" id="ndm-deep-pause-${esc(diskName)}">⏸ Pause</button>
+    <input class="ndm3-log-search" id="ndm-deep-search-${esc(diskName)}" placeholder="Search logs..." type="text">
+  </div>
+  <div class="ndm3-log-box" id="ndm-deep-log-${esc(diskName)}"></div>
+
+  <!-- Problems -->
+  <div class="ndm3-sec">PROBLEM DETECTION</div>
+  <div class="ndm3-problems" id="ndm-deep-problems-${esc(diskName)}">
+    ${problemCol('ndm-deep-crits-'+esc(diskName),'CRITICAL','crit')}
+    ${problemCol('ndm-deep-warns-'+esc(diskName),'WARNINGS','warn')}
+    ${problemCol('ndm-deep-oks-'+esc(diskName),'HEALTHY','ok')}
+  </div>
+
+  <!-- AI Engine -->
+  <div class="ndm3-sec">AI FORENSIC ANALYSIS</div>
+  <div class="ndm3-ai-wrap" id="ndm-deep-ai-${esc(diskName)}">
+    <div class="ndm3-ai-ring-col">
+      <canvas id="cv-ai-${esc(diskName)}" width="140" height="140"></canvas>
+      <div class="ndm3-ai-score ndm3-c-muted" id="ndm-ai-score-${esc(diskName)}">—</div>
+      <div class="ndm3-ai-verdict ndm3-c-muted" id="ndm-ai-verdict-${esc(diskName)}">ANALYZING</div>
+      <div class="ndm3-ai-conf" id="ndm-ai-conf-${esc(diskName)}"></div>
+    </div>
+    <div class="ndm3-ai-body">
+      <div class="ndm3-ai-predict ndm3-c-muted" id="ndm-ai-predict-${esc(diskName)}">Awaiting scan completion for predictive analysis...</div>
+      <div class="ndm3-ai-findings" id="ndm-ai-findings-${esc(diskName)}"></div>
+      <div class="ndm3-ai-rec" id="ndm-ai-rec-${esc(diskName)}"></div>
+    </div>
+  </div>
+
+  <!-- Stale banner -->
+  <div class="ndm3-stale-banner">⚠ TELEMETRY STREAM STALE · awaiting reconnect</div>
+</div>`;
+  }
+
+  function injectDeepPanel(diskName, hostId, jobId) {
+    if (panels[diskName]) return;
+    const st = {hostId, jobId, progress:0, startTs:Date.now(), ioAnomaly:null};
+    initSurface(st);
+    scans[diskName] = st;
+
+    const card = findDiskCard(diskName);
+    if (!card) {
+      let attempts=0;
+      const t = setInterval(()=>{
+        attempts++;
+        const c = findDiskCard(diskName);
+        if (c) { clearInterval(t); _doInjectDeep(c, diskName, hostId, jobId); }
+        else if (attempts>20) clearInterval(t);
+      },250);
+      return;
+    }
+    _doInjectDeep(card, diskName, hostId, jobId);
+  }
+
+  function _doInjectDeep(card, diskName, hostId, jobId) {
+    activateAnalysisMode(diskName);
+    const wrap = document.createElement('div');
+    wrap.innerHTML = buildDeepPanel(diskName);
+    const panel = wrap.firstElementChild;
+    card.appendChild(panel);
+    panels[diskName] = panel;
+    logFilters[diskName] = 'ALL';
+
+    // wire close
+    panel.querySelector('.ndm3-close').addEventListener('click', () => {
+      panel.remove();
+      delete panels[diskName];
+      delete scans[diskName];
+      deactivateAnalysisMode(diskName);
+      if (sock && watchedHostId) sock.emit('disk:watch:stop');
+    });
+
+    // wire log filters
+    const filterBar = panel.querySelector(`#ndm-deep-filters-${diskName}`);
+    if (filterBar) {
+      filterBar.querySelectorAll('.ndm3-log-filter').forEach(btn => {
+        btn.addEventListener('click', () => {
+          filterBar.querySelectorAll('.ndm3-log-filter').forEach(b=>b.classList.remove('active'));
+          btn.classList.add('active');
+          logFilters[diskName] = btn.dataset.filter;
+          rebuildLog(panel, diskName);
+        });
+      });
+    }
+
+    // wire pause
+    const pauseBtn = panel.querySelector(`#ndm-deep-pause-${diskName}`);
+    if (pauseBtn) {
+      pauseBtn.addEventListener('click', () => {
+        logPaused[diskName] = !logPaused[diskName];
+        pauseBtn.textContent = logPaused[diskName] ? '▶ Resume' : '⏸ Pause';
+        pauseBtn.classList.toggle('paused', !!logPaused[diskName]);
+        if (!logPaused[diskName]) rebuildLog(panel, diskName);
+      });
+    }
+
+    // wire search
+    const searchInput = panel.querySelector(`#ndm-deep-search-${diskName}`);
+    if (searchInput) {
+      searchInput.addEventListener('input', () => {
+        logSearch[diskName] = searchInput.value;
+        rebuildLog(panel, diskName);
+      });
+    }
+
+    // empty problem state
+    updateProblems(panel, diskName, [], [], []);
+
+    // emit watch start
+    if (sock && hostId) sock.emit('disk:watch:start', {hostId});
+  }
+
+  function updateHeader(panel, diskName, progress, startTs) {
+    if (!panel) return;
+    const state = scans[diskName];
+    const elapsed  = Math.floor((Date.now()-startTs)/1000);
+    const remaining = progress>2 ? Math.floor(elapsed*(100-progress)/progress) : null;
+    const phaseIdx  = Math.floor((progress/100)*SCAN_PHASES.length);
+    const phase     = SCAN_PHASES[Math.min(phaseIdx, SCAN_PHASES.length-1)];
+
+    setTxt(panel, `#ndm-deep-prog-${diskName}`,  null, {style:`width:${progress}%`});
+    setTxt(panel, `#ndm-deep-pct-${diskName}`,   progress.toFixed(0));
+    setTxt(panel, `#ndm-deep-ela-${diskName}`,   fmtSec(elapsed));
+    setTxt(panel, `#ndm-deep-eta-${diskName}`,   remaining!=null ? '~'+fmtSec(remaining) : '—');
+    setTxt(panel, `#ndm-deep-phase-${diskName}`, phase);
+
+    // scan line
+    const sl = panel.querySelector(`#ndm-scanline-${diskName}`);
+    if (sl) sl.style.left = progress+'%';
+  }
+
+  function updateDeepMetrics(panel, diskName, vals) {
+    if (!panel) return;
+    const {rkBs,wkBs,rAwait,wAwait,util,rIops,wIops,aqu,temp} = vals;
+    const latMs = Math.max(rAwait,wAwait);
+    const rMBs  = (rkBs/1024).toFixed(1);
+    const wMBs  = (wkBs/1024).toFixed(1);
+
+    const latCls = latMs>80?'ndm3-c-crit':latMs>30?'ndm3-c-warn':'ndm3-c-ok';
+    const utlCls = util>90?'ndm3-c-crit':util>70?'ndm3-c-warn':'ndm3-c-ok';
+    const tmpCls = (temp||0)>55?'ndm3-c-crit':(temp||0)>45?'ndm3-c-warn':'ndm3-c-ok';
+
+    setMbox(panel, `ndm-m-rthru-${diskName}`, rMBs, 'MB/s', 'ndm3-c-cyan');
+    setMbox(panel, `ndm-m-wthru-${diskName}`, wMBs, 'MB/s', 'ndm3-c-ind');
+    setMbox(panel, `ndm-m-rlat-${diskName}`,  latMs.toFixed(1), 'ms', latCls);
+    setMbox(panel, `ndm-m-temp-${diskName}`,  temp?temp+'':'—', '°C', tmpCls);
+    setMbox(panel, `ndm-m-riops-${diskName}`, fmtNum(rIops), 'ops', 'ndm3-c-cyan');
+    setMbox(panel, `ndm-m-wiops-${diskName}`, fmtNum(wIops), 'ops', 'ndm3-c-ind');
+    setMbox(panel, `ndm-m-que-${diskName}`,   aqu.toFixed(1), '', aqu>4?'ndm3-c-warn':'');
+    setMbox(panel, `ndm-m-util-${diskName}`,  util.toFixed(0), '%', utlCls);
+
+    // header quick stats
+    setTxt(panel, `#ndm-deep-temp-${diskName}`, temp?temp+'°C':'—');
+    setTxt(panel, `#ndm-deep-load-${diskName}`, util.toFixed(0)+'%');
+    setTxt(panel, `#ndm-deep-lat-${diskName}`,  latMs.toFixed(1)+'ms');
+    setTxt(panel, `#ndm-deep-iops-${diskName}`, fmtNum(rIops+wIops));
+  }
+
+  function redrawDeepCharts(panel, diskName, hostId) {
+    if (!panel) return;
+    const ring = hostRings[hostId];
+    if (!ring) return;
+    const n = ring.count;
+    const h = ring.head;
+    const thr  = [orderedRing(ring.rkBs,h,n), orderedRing(ring.wkBs,h,n)];
+    const lat  = [orderedRing(ring.rAwait,h,n), orderedRing(ring.wAwait,h,n)];
+    const iop  = [orderedRing(ring.rIops,h,n), orderedRing(ring.wIops,h,n)];
+    const uti  = [orderedRing(ring.util,h,n)];
+    const que  = [orderedRing(ring.aqu,h,n)];
+    const thm  = [orderedRing(ring.temp,h,n)];
+
+    drawChart(panel.querySelector(`#cv-thr-${diskName}`), thr, ['#22d3ee','#818cf8'], {label:true});
+    drawChart(panel.querySelector(`#cv-lat-${diskName}`), lat, ['#22d3ee','#f59e0b'], {label:true, threshold:30, max:null});
+    drawChart(panel.querySelector(`#cv-iop-${diskName}`), iop, ['#22d3ee','#818cf8'], {label:true});
+    drawChart(panel.querySelector(`#cv-uti-${diskName}`), uti, ['#22c55e'],           {max:100});
+    drawChart(panel.querySelector(`#cv-que-${diskName}`), que, ['#f59e0b'],           {label:true, threshold:4});
+    drawChart(panel.querySelector(`#cv-thm-${diskName}`), thm, ['#ef4444'],           {label:true, max:80});
+  }
+
+  function redrawFastCharts(prefix, diskName, hostId) {
+    const ring = hostRings[hostId];
+    if (!ring) return;
+    const panel = fastPanels[diskName];
+    if (!panel) return;
+    const n=ring.count, h=ring.head;
+    const pfx = prefix+'-'+diskName;
+    drawChart(panel.querySelector(`#${prefix}cv-thr-${diskName}`), [orderedRing(ring.rkBs,h,n),orderedRing(ring.wkBs,h,n)], ['#22d3ee','#818cf8'],{});
+    drawChart(panel.querySelector(`#${prefix}cv-lat-${diskName}`), [orderedRing(ring.rAwait,h,n),orderedRing(ring.wAwait,h,n)], ['#22d3ee','#f59e0b'],{threshold:30});
+    drawChart(panel.querySelector(`#${prefix}cv-iop-${diskName}`), [orderedRing(ring.rIops,h,n),orderedRing(ring.wIops,h,n)], ['#22d3ee','#818cf8'],{});
+    drawChart(panel.querySelector(`#${prefix}cv-uti-${diskName}`), [orderedRing(ring.util,h,n)], ['#22c55e'],{max:100});
+    drawChart(panel.querySelector(`#${prefix}cv-que-${diskName}`), [orderedRing(ring.aqu,h,n)],  ['#f59e0b'],{threshold:4});
+    drawChart(panel.querySelector(`#${prefix}cv-thm-${diskName}`), [orderedRing(ring.temp,h,n)], ['#ef4444'],{max:80});
+  }
+
+  function updateProblems(panel, diskName, crits, warns, oks) {
+    if (!panel) return;
+    const setCol = (id, items, dotColor) => {
+      const el = panel.querySelector('#'+id);
+      if (!el) return;
+      if (items.length===0) {
+        el.innerHTML = `<div class="ndm3-empty-state"><span class="ndm3-empty-dot"></span>No issues</div>`;
+        return;
+      }
+      el.innerHTML = items.map(i =>
+        `<div class="ndm3-issue-item">
+          <div class="ndm3-issue-msg"><span class="ndm3-issue-dot" style="background:${dotColor}"></span><span>${esc(i.msg||i)}</span></div>
+          ${i.fix?`<div class="ndm3-issue-fix">→ ${esc(i.fix)}</div>`:''}
+        </div>`
+      ).join('');
+    };
+    setCol('ndm-deep-crits-'+diskName, crits, '#ef4444');
+    setCol('ndm-deep-warns-'+diskName, warns, '#f59e0b');
+    setCol('ndm-deep-oks-'+diskName,   oks,   '#22c55e');
+  }
+
+  function updateDeepAI(panel, diskName, hostId, scanResult) {
+    if (!panel) return;
+    const ai = computeAI(scanResult, hostRings[hostId]);
+
+    const cv = panel.querySelector(`#cv-ai-${diskName}`);
+    if (cv) drawHealthRing(cv, 100-ai.risk, {size:140, scoreFontSize:26, label:ai.verdict});
+
+    setTxt(panel, `#ndm-ai-score-${diskName}`,   String(ai.risk)+'/100');
+    setTxt(panel, `#ndm-ai-verdict-${diskName}`,  ai.verdict);
+    setTxt(panel, `#ndm-ai-conf-${diskName}`,     `Confidence: ${ai.conf}%`);
+
+    const el = panel.querySelector(`#ndm-ai-score-${diskName}`);
+    if (el) el.className = `ndm3-ai-score ${ai.verdictCls}`;
+    const vEl = panel.querySelector(`#ndm-ai-verdict-${diskName}`);
+    if (vEl) vEl.className = `ndm3-ai-verdict ${ai.verdictCls}`;
+
+    const pd = (scanResult||{}).predicted_days;
+    const pEl = panel.querySelector(`#ndm-ai-predict-${diskName}`);
+    if (pEl) {
+      pEl.className = `ndm3-ai-predict ${pd!=null&&pd<30?'ndm3-c-warn':'ndm3-c-ok'}`;
+      pEl.textContent = pd!=null
+        ? (pd<30 ? `⚠ Risk trend — potential issue in ~${pd} days` : `Stable trend — no failure predicted`)
+        : 'No trend data available';
+    }
+
+    const fEl = panel.querySelector(`#ndm-ai-findings-${diskName}`);
+    if (fEl) {
+      const all = [...(ai.findings.map(f=>({c:f.c,t:f.t}))), ...(ai.positives.map(t=>({c:'ok',t})))];
+      fEl.innerHTML = all.map(f => {
+        const dotClr = f.c==='crit'?'#ef4444':f.c==='warn'?'#f59e0b':'#22c55e';
+        return `<div class="ndm3-ai-finding"><span class="ndm3-ai-finding-dot" style="background:${dotClr}"></span><span>${esc(f.t)}</span></div>`;
+      }).join('');
+    }
+
+    const rEl = panel.querySelector(`#ndm-ai-rec-${diskName}`);
+    if (rEl) rEl.textContent = '→ '+ai.rec;
+  }
+
+  function updateDeepTopology(panel, diskName, hostData) {
+    if (!panel || !hostData) return;
+    const diskInfo = (hostData.disks||[]).find(d=>d.name===diskName)||{};
+    const rows = buildTopology(diskName, diskInfo, hostData.partitions, hostData.lvm);
+    renderTopology(panel.querySelector(`#ndm-deep-tree-${diskName}`), rows);
+  }
+
+  function finalizeDeepScan(panel, diskName, hostId, result) {
+    if (!panel) return;
+    const state = scans[diskName]||{};
+
+    // update badge
+    const badge = panel.querySelector(`#ndm-deep-badge-${diskName}`);
+    if (badge) {
+      const failed = (result||{}).failed;
+      badge.className = 'ndm3-badge ' + (failed?'ndm3-badge-crit':'ndm3-badge-pass');
+      badge.textContent = failed ? '✕ ISSUES FOUND' : '✓ PASSED';
+    }
+
+    // set progress to 100
+    const prog = panel.querySelector(`#ndm-deep-prog-${diskName}`);
+    if (prog) prog.style.width='100%';
+    setTxt(panel, `#ndm-deep-pct-${diskName}`,   '100');
+    setTxt(panel, `#ndm-deep-phase-${diskName}`, 'ANALYSIS COMPLETE');
+    setTxt(panel, `#ndm-deep-eta-${diskName}`,   '00:00');
+
+    // scan line to end
+    const sl = panel.querySelector(`#ndm-scanline-${diskName}`);
+    if (sl) { sl.style.left='100%'; sl.style.opacity='0'; }
+
+    // surface — mark bad sectors
+    if (result&&result.badSectors>0) {
+      markBadSectors(state, result.badSectors);
+    }
+    // fill remaining as healthy
+    if (state.surface) {
+      for (let i=0;i<state.surface.length;i++) {
+        if (state.surface[i]===UNSCANNED) state.surface[i]=HEALTHY;
+      }
+    }
+    const surfCv = panel.querySelector(`#cv-surf-${diskName}`);
+    if (surfCv) drawSurface(surfCv, state);
+
+    // problems
+    const {crits,warns,oks} = buildProblems(result, state.ioAnomaly);
+    updateProblems(panel, diskName, crits, warns, oks);
+
+    // AI
+    updateDeepAI(panel, diskName, hostId, result);
+
+    // logs
+    appendLog(panel, diskName, (result&&result.failed)?'error':'ok', `[SCAN] Deep forensics complete — ${diskName}`);
+
+    // remove backdrop
+    deactivateAnalysisMode(diskName);
+  }
+
+  // ── Shared Metric Updater for Fast/Virt Strip ──────────────────────────────
+  function updateFastStrip(panel, diskName, prefix, vals) {
+    if (!panel) return;
+    const {rkBs,wkBs,rAwait,wAwait,util,rIops,wIops,aqu} = vals;
+    const latMs = Math.max(rAwait,wAwait);
+    const latCls = latMs>80?'ndm3-c-crit':latMs>30?'ndm3-c-warn':'';
+    const utlCls = util>90?'ndm3-c-crit':util>70?'ndm3-c-warn':'';
+    setChip(panel, prefix+'rc',  fmtNum(rkBs));
+    setChip(panel, prefix+'wc',  fmtNum(wkBs));
+    setChip(panel, prefix+'lat', latMs.toFixed(1), latCls);
+    setChip(panel, prefix+'iops',fmtNum(rIops+wIops));
+    setChip(panel, prefix+'util',util.toFixed(0)+'%', utlCls);
+    setChip(panel, prefix+'que', aqu.toFixed(1));
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ═══ SCAN SERVER: full-page overlay, UI, rendering, socket handlers    ═══
+  // ══════════════════════════════════════════════════════════════════════════
+
+  const SS_MODES_LABELS = {
+    quick:       'Quick',
+    deep:        'Deep',
+    ai:          'AI Predictive',
+    security:    'Security',
+    storage:     'Storage',
+    performance: 'Performance',
+    forensics:   'Forensics',
+    full:        'Full Audit',
+  };
+  const SS_CAT_LABELS = {
+    quick:       ['system','services'],
+    deep:        ['system','storage','network','services','logs'],
+    ai:          ['system','storage','services','logs','security'],
+    security:    ['security','network','logs'],
+    storage:     ['storage','logs'],
+    performance: ['performance','system','kernel'],
+    forensics:   ['kernel','security','logs','hardware'],
+    full:        ['system','storage','network','services','logs','security','hardware','performance','kernel'],
+  };
+  const SS_LOG_TAGS = ['ALL','KERNEL','PM2','DOCKER','POSTGRES','REDIS','NGINX','SECURITY','SMART','NETWORK','FILESYSTEM','SERVICE','SYSTEM','MEMORY','CPU','THERMAL','STORAGE','SYSLOG','PROCESS'];
+
+  // ─── Build page HTML ────────────────────────────────────────────────────
+  function buildScanServerPage() {
+    const modes = Object.keys(SS_MODES_LABELS).map(m =>
+      `<button class="ndm-ss-mode-btn${m===scanServer.mode?' active':''}" data-mode="${m}">${SS_MODES_LABELS[m]}</button>`
+    ).join('');
+    const cats = (SS_CAT_LABELS[scanServer.mode]||[]).map(c =>
+      `<div class="ndm-ss-cat-row" data-sscat="${c}"><span class="ndm-ss-cat-dot"></span>${c}</div>`
+    ).join('');
+    const filterBtns = SS_LOG_TAGS.slice(0,12).map((t,i) =>
+      `<button class="ndm-ss-flt${i===0?' active':''}" data-sstag="${t}">${t}</button>`
+    ).join('');
+
+    return `<div class="ndm-ss-overlay" id="ndm-scanserver">
+  <!-- Top bar -->
+  <div class="ndm-ss-topbar">
+    <div class="ndm-ss-title">◈ SCAN SERVER</div>
+    <div class="ndm-ss-topbar-status idle" id="ndm-ss-status"><span id="ndm-ss-status-txt">IDLE</span></div>
+    <div class="ndm-ss-health-chip" id="ndm-ss-health" style="display:none"></div>
+    <div class="ndm-ss-host-chip" id="ndm-ss-host">—</div>
+    <div class="ndm-ss-dur" id="ndm-ss-dur"></div>
+    <select class="ndm-ss-sched-sel" id="ndm-ss-sched-sel" title="Auto-scan schedule">
+      <option value="0">⏱ Manual</option>
+      <option value="900000">Every 15m</option>
+      <option value="1800000">Every 30m</option>
+      <option value="3600000">Every 1h</option>
+    </select>
+    <button class="ndm-ss-close" id="ndm-ss-close">✕ Close</button>
+  </div>
+
+  <!-- Mode selector + progress -->
+  <div class="ndm-ss-controls">
+    <div class="ndm-ss-modes" id="ndm-ss-modes">${modes}</div>
+    <button class="ndm-ss-scan-btn" id="ndm-ss-scan-btn">▶ SCAN</button>
+    <div class="ndm-ss-progress-wrap">
+      <div class="ndm-ss-progress-bar">
+        <div class="ndm-ss-progress-fill" id="ndm-ss-prog-fill" style="width:0%"></div>
+      </div>
+      <div class="ndm-ss-progress-pct" id="ndm-ss-prog-pct">0%</div>
+      <div class="ndm-ss-progress-step" id="ndm-ss-prog-step"></div>
+    </div>
+  </div>
+
+  <!-- 3-column body -->
+  <div class="ndm-ss-body">
+
+    <!-- LEFT: controls + stats -->
+    <div class="ndm-ss-left">
+      <div class="ndm-ss-block">
+        <div class="ndm-ss-block-hdr">SCAN CATEGORIES</div>
+        <div class="ndm-ss-cat-checks" id="ndm-ss-cats">${cats}</div>
+      </div>
+      <div class="ndm-ss-block">
+        <div class="ndm-ss-block-hdr">SYSTEM SNAPSHOT</div>
+        <div id="ndm-ss-stats">
+          <div class="ndm-ss-stat-row"><span class="ndm-ss-stat-lbl">Uptime</span><span class="ndm-ss-stat-val" id="ndm-ss-st-uptime">—</span></div>
+          <div class="ndm-ss-stat-row"><span class="ndm-ss-stat-lbl">Load 1m</span><span class="ndm-ss-stat-val" id="ndm-ss-st-load">—</span></div>
+          <div class="ndm-ss-stat-row"><span class="ndm-ss-stat-lbl">CPU</span><span class="ndm-ss-stat-val" id="ndm-ss-st-cpu">—</span></div>
+          <div class="ndm-ss-stat-row"><span class="ndm-ss-stat-lbl">Memory</span><span class="ndm-ss-stat-val" id="ndm-ss-st-mem">—</span></div>
+          <div class="ndm-ss-stat-row"><span class="ndm-ss-stat-lbl">Disk</span><span class="ndm-ss-stat-val" id="ndm-ss-st-disk">—</span></div>
+          <div class="ndm-ss-stat-row"><span class="ndm-ss-stat-lbl">Services</span><span class="ndm-ss-stat-val" id="ndm-ss-st-svc">—</span></div>
+          <div class="ndm-ss-stat-row"><span class="ndm-ss-stat-lbl">Findings</span><span class="ndm-ss-stat-val" id="ndm-ss-st-findings">—</span></div>
+        </div>
+      </div>
+      <div class="ndm-ss-block">
+        <div class="ndm-ss-block-hdr">◷ SCAN HISTORY</div>
+        <div id="ndm-ss-history-list" class="ndm-ss-history-list">
+          <div class="ndm-ss-history-empty">No scans yet this session</div>
+        </div>
+        <button class="ndm-ss-export-btn" id="ndm-ss-export-btn">↓ Export Findings JSON</button>
+      </div>
+    </div>
+
+    <!-- CENTER: findings -->
+    <div class="ndm-ss-center">
+      <div class="ndm-ss-findings-hdr">
+        <div class="ndm-ss-count-chip crit"><span id="ndm-ss-cnt-crit">0</span> CRITICAL</div>
+        <div class="ndm-ss-count-chip warn"><span id="ndm-ss-cnt-warn">0</span> WARNING</div>
+        <div class="ndm-ss-count-chip ok"><span id="ndm-ss-cnt-ok">0</span> OK</div>
+      </div>
+      <div id="ndm-ss-findings-list">
+        <div class="ndm-ss-empty">
+          <div class="ndm-ss-empty-icon">◈</div>
+          Select a scan mode and click <b>SCAN</b> to begin infrastructure analysis
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: AI engine -->
+    <div class="ndm-ss-right">
+      <div class="ndm-ss-block">
+        <div class="ndm-ss-block-hdr">AI RISK ENGINE</div>
+        <div class="ndm-ss-ai-gauge-wrap">
+          <canvas id="ndm-ss-ai-cv" width="120" height="120"></canvas>
+          <div class="ndm-ss-ai-verdict" id="ndm-ss-ai-verdict">AWAITING SCAN</div>
+          <div class="ndm-ss-ai-conf" id="ndm-ss-ai-conf">—</div>
+        </div>
+      </div>
+      <div class="ndm-ss-block" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
+        <div class="ndm-ss-block-hdr">FINDINGS STREAM</div>
+        <div class="ndm-ss-ai-stream" id="ndm-ss-ai-stream" style="flex:1;overflow-y:auto;max-height:300px"></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Bottom terminal -->
+  <div class="ndm-ss-bottom">
+    <div class="ndm-ss-term-hdr">
+      <span class="ndm-ss-term-title">◈ DIAGNOSTIC TERMINAL</span>
+      <div id="ndm-ss-filters">${filterBtns}</div>
+      <input class="ndm-ss-term-search" id="ndm-ss-search" placeholder="search..." type="text">
+    </div>
+    <div class="ndm-ss-log-virt" id="ndm-ss-log-box">
+      <div class="ndm-ss-log-spacer" id="ndm-ss-log-spacer" style="height:0"></div>
+      <button class="ndm-ss-log-jump" id="ndm-ss-log-jump">↓ NEW EVENTS</button>
+    </div>
+  </div>
+
+  <!-- Finding detail modal -->
+  <div class="ndm-ss-modal" id="ndm-ss-modal" style="display:none">
+    <div class="ndm-ss-modal-backdrop" id="ndm-ss-modal-backdrop"></div>
+    <div class="ndm-ss-modal-body">
+      <div class="ndm-ss-modal-hdr">
+        <div class="ndm-ss-modal-hdr-left">
+          <span class="ndm-ss-modal-sev" id="ndm-modal-sev"></span>
+          <span class="ndm-ss-modal-cat" id="ndm-modal-cat"></span>
+        </div>
+        <button class="ndm-ss-modal-close" id="ndm-ss-modal-close">✕</button>
+      </div>
+      <div class="ndm-ss-modal-msg" id="ndm-modal-msg"></div>
+      <div class="ndm-ss-modal-section">SOURCE · CONFIDENCE</div>
+      <div class="ndm-ss-modal-meta" id="ndm-modal-meta"></div>
+      <div class="ndm-ss-modal-section">RECOMMENDED FIX</div>
+      <pre class="ndm-ss-modal-fix" id="ndm-modal-fix"></pre>
+      <button class="ndm-ss-modal-copy" id="ndm-modal-copy-btn">⎘ Copy Fix Command</button>
+      <span class="ndm-ss-modal-copy-ok" id="ndm-modal-copy-ok"></span>
+    </div>
+  </div>
+
+</div>`;
+  }
+
+  // ─── Show / hide ────────────────────────────────────────────────────────
+  function showScanServer() {
+    if (scanServer.active) return;
+    scanServer.active = true;
+    const existing = document.getElementById('ndm-scanserver');
+    if (existing) { existing.classList.remove('hidden'); _wireScanServerEvents(); return; }
+    const el = document.createElement('div');
+    el.id = 'ndm-scanserver-wrap';
+    el.innerHTML = buildScanServerPage();
+    document.body.appendChild(el);
+    _wireScanServerEvents();
+    updateSsStatus();
+    renderSsFindings();
+    renderSsLogVirt();
+    renderSsHistory(scanServer.history || []);
+    if (sock) sock.emit('server:scan:history:get');
+  }
+
+  function hideScanServer() {
+    scanServer.active = false;
+    const el = document.getElementById('ndm-scanserver');
+    if (el) el.classList.add('hidden');
+    const wrap = document.getElementById('ndm-scanserver-wrap');
+    if (wrap) wrap.remove();
+  }
+
+  function _wireScanServerEvents() {
+    // Close
+    const closeBtn = document.getElementById('ndm-ss-close');
+    if (closeBtn) closeBtn.onclick = hideScanServer;
+
+    const escHandler = (e) => { if (e.key === 'Escape' && scanServer.active) hideScanServer(); };
+    document.removeEventListener('keydown', escHandler);
+    document.addEventListener('keydown', escHandler);
+
+    // Scan button
+    const scanBtn = document.getElementById('ndm-ss-scan-btn');
+    if (scanBtn) scanBtn.onclick = () => { if (!scanServer.scanning) startServerScan(); };
+
+    // Mode buttons
+    const modesEl = document.getElementById('ndm-ss-modes');
+    if (modesEl) modesEl.querySelectorAll('.ndm-ss-mode-btn').forEach(btn => {
+      btn.onclick = () => {
+        scanServer.mode = btn.dataset.mode;
+        modesEl.querySelectorAll('.ndm-ss-mode-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        updateSsCategoryList();
+      };
+    });
+
+    // Filter chips
+    const filtersEl = document.getElementById('ndm-ss-filters');
+    if (filtersEl) filtersEl.querySelectorAll('.ndm-ss-flt').forEach(btn => {
+      btn.onclick = () => {
+        scanServer.logFilter = btn.dataset.sstag;
+        filtersEl.querySelectorAll('.ndm-ss-flt').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        renderSsLogVirt();
+      };
+    });
+
+    // Search
+    const searchEl = document.getElementById('ndm-ss-search');
+    if (searchEl) searchEl.oninput = () => {
+      scanServer.logSearch = searchEl.value;
+      renderSsLogVirt();
+    };
+
+    // Log scroll
+    const logBox = document.getElementById('ndm-ss-log-box');
+    const jumpBtn = document.getElementById('ndm-ss-log-jump');
+    if (logBox) {
+      logBox.addEventListener('scroll', () => {
+        const dist = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight;
+        scanServer.logScrollLocked = dist > 80;
+        if (!scanServer.logScrollLocked) { scanServer.logNewCount = 0; if (jumpBtn) jumpBtn.classList.remove('show'); }
+        renderSsLogVirt();
+      });
+    }
+    if (jumpBtn) jumpBtn.onclick = () => {
+      if (logBox) logBox.scrollTop = logBox.scrollHeight;
+      scanServer.logScrollLocked = false; scanServer.logNewCount = 0;
+      jumpBtn.classList.remove('show');
+    };
+
+    // Scheduler dropdown
+    const schedSel = document.getElementById('ndm-ss-sched-sel');
+    if (schedSel) schedSel.onchange = () => {
+      const ms = parseInt(schedSel.value) || 0;
+      if (sock) sock.emit('server:scan:schedule', { intervalMs: ms, mode: scanServer.mode });
+      const statusTxt = document.getElementById('ndm-ss-status-txt');
+      if (statusTxt && !scanServer.scanning) {
+        statusTxt.textContent = ms > 0 ? `AUTO · ${ms>=3600000?'1h':ms>=1800000?'30m':'15m'}` : 'IDLE';
+      }
+    };
+
+    // Export button
+    const exportBtn = document.getElementById('ndm-ss-export-btn');
+    if (exportBtn) exportBtn.onclick = exportFindings;
+
+    // Finding modal close
+    const modalClose = document.getElementById('ndm-ss-modal-close');
+    if (modalClose) modalClose.onclick = closeFindingModal;
+    const backdrop = document.getElementById('ndm-ss-modal-backdrop');
+    if (backdrop) backdrop.onclick = closeFindingModal;
+
+    // Finding modal copy
+    const copyBtn = document.getElementById('ndm-modal-copy-btn');
+    if (copyBtn) copyBtn.onclick = () => {
+      const fix = document.getElementById('ndm-modal-fix');
+      if (fix && fix.textContent) {
+        navigator.clipboard.writeText(fix.textContent).then(() => {
+          const ok = document.getElementById('ndm-modal-copy-ok');
+          if (ok) { ok.textContent = '✓ Copied'; setTimeout(() => { ok.textContent = ''; }, 2000); }
+        }).catch(() => {});
+      }
+    };
+  }
+
+  // ─── Start a scan ────────────────────────────────────────────────────────
+  function startServerScan(mode) {
+    if (!sock) return;
+    if (mode) scanServer.mode = mode;
+    scanServer.findings = [];
+    scanServer.progress = 0;
+    ssLogBuf.length = 0;
+    scanServer.logNewCount = 0;
+    if (!scanServer.active) showScanServer();
+    sock.emit('server:scan:request', { mode: scanServer.mode });
+  }
+
+  // ─── Update status ───────────────────────────────────────────────────────
+  function updateSsStatus() {
+    const el = document.getElementById('ndm-ss-status');
+    const txt = document.getElementById('ndm-ss-status-txt');
+    const hel = document.getElementById('ndm-ss-health');
+    const btn = document.getElementById('ndm-ss-scan-btn');
+    const dur = document.getElementById('ndm-ss-dur');
+    const hostEl = document.getElementById('ndm-ss-host');
+    if (!el) return;
+    el.className = 'ndm-ss-topbar-status';
+    if (scanServer.scanning) {
+      el.classList.add('scanning'); if (txt) txt.textContent = 'SCANNING...';
+      if (btn) { btn.disabled = true; btn.textContent = '⏳ SCANNING'; }
+      const fill = document.getElementById('ndm-ss-prog-fill');
+      if (fill) fill.classList.add('active');
+    } else {
+      const h = scanServer.health;
+      el.classList.add(h ? h.toLowerCase() : 'idle');
+      if (txt) txt.textContent = h ? h : 'IDLE';
+      if (btn) { btn.disabled = false; btn.textContent = '▶ SCAN'; }
+      const fill = document.getElementById('ndm-ss-prog-fill');
+      if (fill) fill.classList.remove('active');
+      if (h && hel) { hel.textContent = h; hel.className = `ndm-ss-health-chip ${h}`; hel.style.display=''; }
+    }
+    if (hostEl) hostEl.textContent = watchedHostId ? ('host: '+String(watchedHostId).slice(0,16)) : 'local server';
+    if (dur && scanServer.startTs) {
+      const s = Math.round((Date.now()-scanServer.startTs)/1000);
+      dur.textContent = `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
+    }
+  }
+
+  function updateSsProgress(data) {
+    scanServer.progress = data.pct || 0;
+    const fill = document.getElementById('ndm-ss-prog-fill');
+    const pct = document.getElementById('ndm-ss-prog-pct');
+    const step = document.getElementById('ndm-ss-prog-step');
+    if (fill) fill.style.width = scanServer.progress + '%';
+    if (pct) pct.textContent = scanServer.progress + '%';
+    if (step) step.textContent = data.tag ? `[${data.tag}] ${data.step||''}` : '';
+    // update category dot
+    const cats = document.querySelectorAll('#ndm-ss-cats .ndm-ss-cat-row');
+    if (cats && data.tag) {
+      cats.forEach(r => {
+        const c = r.dataset.sscat;
+        const dot = r.querySelector('.ndm-ss-cat-dot');
+        if (!dot) return;
+        const isActive = (c === (data.tag||'').toLowerCase() || (c==='system' && ['SYSTEM','CPU','THERMAL','KERNEL','MEMORY'].includes(data.tag)));
+        if (isActive) { dot.className = 'ndm-ss-cat-dot active'; r.classList.add('active'); }
+      });
+    }
+  }
+
+  function updateSsCategoryList() {
+    const el = document.getElementById('ndm-ss-cats');
+    if (!el) return;
+    const cats = SS_CAT_LABELS[scanServer.mode] || [];
+    el.innerHTML = cats.map(c =>
+      `<div class="ndm-ss-cat-row" data-sscat="${c}"><span class="ndm-ss-cat-dot"></span>${c}</div>`
+    ).join('');
+  }
+
+  // ─── Findings rendering ───────────────────────────────────────────────────
+  function renderSsFindings() {
+    const list = document.getElementById('ndm-ss-findings-list');
+    const cntCrit = document.getElementById('ndm-ss-cnt-crit');
+    const cntWarn = document.getElementById('ndm-ss-cnt-warn');
+    const cntOk   = document.getElementById('ndm-ss-cnt-ok');
+    const findings = scanServer.findings;
+    if (cntCrit) cntCrit.textContent = findings.filter(f=>f.sev==='critical').length;
+    if (cntWarn) cntWarn.textContent = findings.filter(f=>f.sev==='warning').length;
+    if (cntOk)   cntOk.textContent   = findings.filter(f=>f.sev==='success'||f.sev==='info').length;
+
+    // Stats sidebar
+    const stFindings = document.getElementById('ndm-ss-st-findings');
+    if (stFindings) {
+      const c = findings.filter(f=>f.sev==='critical').length;
+      stFindings.textContent = findings.length > 0 ? `${findings.length} (${c} crit)` : '—';
+      stFindings.className = 'ndm-ss-stat-val' + (c>0?' crit':findings.length>0?' warn':'');
+    }
+
+    if (!list) return;
+    if (findings.length === 0) {
+      list.innerHTML = `<div class="ndm-ss-empty"><div class="ndm-ss-empty-icon">${scanServer.scanning?'⟳':'◈'}</div>${scanServer.scanning?'Scanning in progress...':'Click SCAN to analyze server infrastructure'}</div>`;
+      return;
+    }
+    list.innerHTML = findings.map((f, idx) => {
+      const dt = new Date(f.ts||Date.now());
+      const ts = `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}:${String(dt.getSeconds()).padStart(2,'0')}`;
+      return `<div class="ndm-ss-finding sev-${esc(f.sev)}" data-fidx="${idx}" title="Click for details">
+        <div class="ndm-ss-finding-bar"></div>
+        <div class="ndm-ss-finding-body">
+          <div class="ndm-ss-finding-meta">
+            <b>${esc(f.category||'')}</b> · ${esc((f.sev||'').toUpperCase())} · ${esc(f.source||'')} · ${ts}
+            <span class="ndm-ss-finding-conf">${f.confidence||'—'}% conf</span>
+          </div>
+          <div class="ndm-ss-finding-msg">${esc(f.msg||'')}</div>
+          ${f.fix ? `<div class="ndm-ss-finding-fix">${esc(f.fix)}</div>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+    // Wire finding card clicks
+    list.querySelectorAll('.ndm-ss-finding').forEach(card => {
+      card.onclick = () => {
+        const idx = parseInt(card.dataset.fidx);
+        if (!isNaN(idx) && scanServer.findings[idx]) showFindingModal(scanServer.findings[idx]);
+      };
+    });
+  }
+
+  // ─── AI panel ────────────────────────────────────────────────────────────
+  function updateSsAIPanel() {
+    const cv = document.getElementById('ndm-ss-ai-cv');
+    const verdict = document.getElementById('ndm-ss-ai-verdict');
+    const conf = document.getElementById('ndm-ss-ai-conf');
+    const stream = document.getElementById('ndm-ss-ai-stream');
+
+    const findings = scanServer.findings;
+    const critCount = findings.filter(f=>f.sev==='critical').length;
+    const warnCount = findings.filter(f=>f.sev==='warning').length;
+
+    // Risk score 0-100
+    const score = Math.min(100, critCount * 30 + warnCount * 10 + (findings.length > 0 ? 5 : 0));
+    const avgConf = findings.length > 0 ? Math.round(findings.reduce((s,f)=>s+(f.confidence||80),0)/findings.length) : 0;
+
+    if (cv) drawHealthRing(cv, score, { size: 120, scoreFontSize: 28,
+      label: score===0 ? 'HEALTHY' : score<30 ? 'LOW RISK' : score<60 ? 'WARNING' : 'CRITICAL' });
+
+    if (verdict) {
+      verdict.textContent = score===0 ? 'ALL CLEAR' : score<30 ? 'LOW RISK' : score<60 ? 'WARNING' : 'CRITICAL';
+      verdict.style.color = score===0||score<30 ? '#22c55e' : score<60 ? '#f59e0b' : '#ef4444';
+    }
+    if (conf) conf.textContent = findings.length > 0 ? `Avg confidence: ${avgConf}% · ${findings.length} findings` : 'No scan data';
+
+    if (stream) {
+      stream.innerHTML = findings.slice(0,12).map(f =>
+        `<div class="ndm-ss-ai-item sev-${esc(f.sev)}">
+          <div class="ndm-ss-finding-bar"></div>
+          <div class="ndm-ss-ai-item-body">
+            <div class="ndm-ss-ai-item-cat">${esc(f.category||'')} · ${esc((f.sev||'').toUpperCase())}</div>
+            <div class="ndm-ss-ai-item-msg">${esc((f.msg||'').slice(0,80))}${(f.msg||'').length>80?'…':''}</div>
+          </div>
+        </div>`
+      ).join('') || '<div style="color:#334155;font-size:10.5px;padding:8px">Awaiting scan results...</div>';
+    }
+  }
+
+  // ─── Log terminal (virtualized) ──────────────────────────────────────────
+  function pushSsLog(level, msg, tsMs) {
+    const ts = tsMs || Date.now();
+    const tagMatch = (msg||'').match(/^\[([A-Z0-9_]+)\]/);
+    const tag = tagMatch ? tagMatch[1] : 'SYSTEM';
+    ssLogBuf.push({ level: level||'info', msg: msg||'', ts, tag });
+    while (ssLogBuf.length > SS_LOG_MAX) ssLogBuf.shift();
+    const box = document.getElementById('ndm-ss-log-box');
+    if (!box) return;
+    if (scanServer.logScrollLocked) {
+      scanServer.logNewCount++;
+      const jump = document.getElementById('ndm-ss-log-jump');
+      if (jump) { jump.textContent = `↓ ${scanServer.logNewCount} NEW`; jump.classList.add('show'); }
+    }
+    renderSsLogVirt();
+    if (!scanServer.logScrollLocked && box) box.scrollTop = box.scrollHeight;
+  }
+
+  function filteredSsLogs() {
+    const fil = scanServer.logFilter;
+    const search = (scanServer.logSearch||'').toLowerCase();
+    return ssLogBuf.filter(l => {
+      if (fil !== 'ALL' && l.tag !== fil) return false;
+      if (search && !(l.msg||'').toLowerCase().includes(search)) return false;
+      return true;
+    });
+  }
+
+  function renderSsLogVirt() {
+    const box = document.getElementById('ndm-ss-log-box');
+    const spacer = document.getElementById('ndm-ss-log-spacer');
+    if (!box || !spacer) return;
+    const arr = filteredSsLogs();
+    spacer.style.height = (arr.length * SS_LINE_H) + 'px';
+    const viewH = box.clientHeight;
+    const scrollTop = box.scrollTop;
+    const first = Math.max(0, Math.floor(scrollTop / SS_LINE_H) - 5);
+    const visible = Math.ceil(viewH / SS_LINE_H) + 10;
+    const last = Math.min(arr.length, first + visible);
+    const search = (scanServer.logSearch||'').toLowerCase();
+    let html = '';
+    for (let i = first; i < last; i++) {
+      const l = arr[i];
+      const dt = new Date(l.ts);
+      const ts = `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}:${String(dt.getSeconds()).padStart(2,'0')}`;
+      let msg = esc(l.msg||'');
+      if (search) {
+        const re = new RegExp('('+search.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');
+        msg = msg.replace(re,'<mark>$1</mark>');
+      }
+      const lvl = (l.level||'info').toLowerCase();
+      html += `<div class="ndm-ss-log-row ${esc(lvl)}" style="top:${i*SS_LINE_H}px"><span class="ts">${ts}</span><span class="tag">[${esc(l.tag)}]</span>${msg}</div>`;
+    }
+    Array.from(box.querySelectorAll('.ndm-ss-log-row')).forEach(r=>r.remove());
+    if (html) {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = html;
+      while(tmp.firstChild) spacer.appendChild(tmp.firstChild);
+    }
+  }
+
+  // ─── Duration ticker ──────────────────────────────────────────────────────
+  let _ssDurTimer = null;
+  function startSsDurTicker() {
+    if (_ssDurTimer) clearInterval(_ssDurTimer);
+    _ssDurTimer = setInterval(() => { if (scanServer.scanning) updateSsStatus(); }, 1000);
+  }
+
+  // ─── Scan history panel ──────────────────────────────────────────────────
+  function renderSsHistory(histArr) {
+    const list = document.getElementById('ndm-ss-history-list');
+    if (!list) return;
+    const arr = (histArr || []).slice(0, 5);
+    if (arr.length === 0) {
+      list.innerHTML = '<div class="ndm-ss-history-empty">No scans yet this session</div>';
+      return;
+    }
+    const prev = arr[1];
+    list.innerHTML = arr.map((h, i) => {
+      const dt = new Date(h.ts);
+      const timeStr = `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}`;
+      const dateStr = `${dt.getMonth()+1}/${dt.getDate()}`;
+      const durS = Math.round((h.duration||0)/1000);
+      const healthCls = h.health === 'CRITICAL' ? 'crit' : h.health === 'WARNING' ? 'warn' : 'ok';
+      let trend = '→';
+      if (i === 0 && prev) {
+        const delta = (h.criticalCount||0) - (prev.criticalCount||0);
+        trend = delta > 0 ? '↑' : delta < 0 ? '↓' : '→';
+      }
+      return `<div class="ndm-ss-history-row" data-hidx="${i}" title="${h.mode} scan · ${h.findingsCount||0} findings">
+        <span class="ndm-ss-history-time">${dateStr} ${timeStr}</span>
+        <span class="ndm-ss-history-mode">${h.mode||'?'}</span>
+        <span class="ndm-ss-history-health ${healthCls}">${h.health||'?'}</span>
+        <span class="ndm-ss-history-counts">${h.criticalCount||0}C ${h.warningCount||0}W</span>
+        <span class="ndm-ss-history-trend">${i===0?trend:''}</span>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.ndm-ss-history-row').forEach(row => {
+      row.onclick = () => {
+        const idx = parseInt(row.dataset.hidx);
+        const h = arr[idx];
+        if (!h || !h.findings) return;
+        const centerList = document.getElementById('ndm-ss-findings-list');
+        if (!centerList) return;
+        centerList.innerHTML = `<div class="ndm-ss-history-replay-hdr">◷ REPLAY: ${(h.mode||'').toUpperCase()} scan from ${new Date(h.ts).toLocaleTimeString()}</div>` +
+          h.findings.map(f => `<div class="ndm-ss-finding sev-${esc(f.sev||'info')}">
+            <div class="ndm-ss-finding-bar"></div>
+            <div class="ndm-ss-finding-body">
+              <div class="ndm-ss-finding-meta"><b>${esc(f.category||'')}</b> · ${esc((f.sev||'').toUpperCase())}</div>
+              <div class="ndm-ss-finding-msg">${esc(f.msg||'')}</div>
+            </div>
+          </div>`).join('');
+      };
+    });
+  }
+
+  // ─── Export findings ─────────────────────────────────────────────────────
+  function exportFindings() {
+    const data = {
+      generated: new Date().toISOString(),
+      server: watchedHostId || '172.12.26.127',
+      mode: scanServer.mode,
+      health: scanServer.health,
+      findings: scanServer.findings,
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `nova-scan-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  }
+
+  // ─── Finding detail modal ────────────────────────────────────────────────
+  function showFindingModal(f) {
+    const modal = document.getElementById('ndm-ss-modal');
+    if (!modal) return;
+    const sevEl    = document.getElementById('ndm-modal-sev');
+    const catEl    = document.getElementById('ndm-modal-cat');
+    const msgEl    = document.getElementById('ndm-modal-msg');
+    const metaEl   = document.getElementById('ndm-modal-meta');
+    const fixEl    = document.getElementById('ndm-modal-fix');
+    const sevColor = f.sev === 'critical' ? '#ef4444' : f.sev === 'warning' ? '#f59e0b' : f.sev === 'success' ? '#22c55e' : '#22d3ee';
+    if (sevEl)  { sevEl.textContent = (f.sev||'').toUpperCase(); sevEl.style.color = sevColor; }
+    if (catEl)  catEl.textContent = f.category || '';
+    if (msgEl)  msgEl.textContent = f.msg || '';
+    if (metaEl) metaEl.textContent = `Source: ${f.source || 'N/A'} · Confidence: ${f.confidence || '—'}%`;
+    if (fixEl)  fixEl.textContent = f.fix || 'No remediation available';
+    modal.style.display = 'flex';
+    document.addEventListener('keydown', _modalEscHandler);
+  }
+
+  function closeFindingModal() {
+    const modal = document.getElementById('ndm-ss-modal');
+    if (modal) modal.style.display = 'none';
+    document.removeEventListener('keydown', _modalEscHandler);
+  }
+
+  function _modalEscHandler(e) {
+    if (e.key === 'Escape') closeFindingModal();
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ═══ CONNECTION RESILIENCE: heartbeat / reconnect / stale / loss      ═══
+  // ══════════════════════════════════════════════════════════════════════════
+
+  function markBeat() {
+    conn.lastBeat = Date.now();
+    if (conn.state === 'stale') {
+      conn.state = 'open';
+      conn.staleSince = null;
+      updateConnChip();
+      Object.values(panels).forEach(p => p && p.classList.remove('stale'));
+      Object.values(fastPanels).forEach(p => p && p.classList.remove('stale'));
+    }
+    // record evt/s rate
+    const now = Date.now();
+    conn.evtCountWindow.push(now);
+    while (conn.evtCountWindow.length && conn.evtCountWindow[0] < now - 5000) conn.evtCountWindow.shift();
+  }
+
+  function pushRtt(ms) {
+    conn.rttRing[conn.rttHead] = ms;
+    conn.rttHead = (conn.rttHead + 1) % conn.rttRing.length;
+    if (conn.rttCount < conn.rttRing.length) conn.rttCount++;
+    conn.lastLatency = ms;
+  }
+
+  function startHeartbeat() {
+    if (conn.heartbeatTimer) clearInterval(conn.heartbeatTimer);
+    conn.heartbeatTimer = setInterval(() => {
+      if (!sock || !sock.connected) return;
+      conn.pingSentAt = Date.now();
+      // socket.io built-in ping is opaque; use a custom one and fallback to engine
+      try { sock.emit('ndm:ping', { ts: conn.pingSentAt }); } catch(e){}
+      // also synthesize an RTT estimate from socket.io's own ping if available
+      if (sock.io && sock.io.engine && typeof sock.io.engine.pingInterval === 'number') {
+        // engine roundtrip is not exposed directly, fall back to last known
+      }
+    }, 5000);
+  }
+
+  function startStaleWatcher() {
+    if (conn.staleTimer) clearInterval(conn.staleTimer);
+    conn.staleTimer = setInterval(() => {
+      if (conn.state !== 'open') return;
+      const since = Date.now() - conn.lastBeat;
+      if (since > 12000) {
+        conn.state = 'stale';
+        conn.staleSince = Date.now();
+        Object.values(panels).forEach(p => p && p.classList.add('stale'));
+        Object.values(fastPanels).forEach(p => p && p.classList.add('stale'));
+        pushAlert({ sev:'warning', source:'CONN', msg:`Telemetry stream stalled · ${(since/1000).toFixed(0)}s without data` });
+      }
+      updateConnChip();
+    }, 1000);
+  }
+
+  function scheduleReconnect() {
+    if (conn.reconnectTimer) return;
+    conn.state = 'reconnecting';
+    updateConnChip();
+    const attempt = ++conn.reconnectAttempts;
+    const delay = Math.min(30000, 1000 * Math.pow(2, attempt - 1));
+    conn.reconnectTimer = setTimeout(() => {
+      conn.reconnectTimer = null;
+      if (sock) { try { sock.connect(); } catch(e){} }
+    }, delay);
+  }
+
+  function trackPacketLoss(jobId, progress) {
+    const last = conn.lastProgressByJob[jobId];
+    if (typeof last === 'number') {
+      const gap = progress - last;
+      if (gap > 15) conn.packetLossPct = Math.min(100, conn.packetLossPct + 1);
+      else conn.packetLossPct = Math.max(0, conn.packetLossPct - 0.05);
+    }
+    conn.lastProgressByJob[jobId] = progress;
+  }
+
+  function evtPerSec() {
+    return (conn.evtCountWindow.length / 5).toFixed(1);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ═══ ALERT ENGINE                                                       ═══
+  // ══════════════════════════════════════════════════════════════════════════
+
+  function pushAlert(a) {
+    const sev = a.sev || 'info';
+    const source = a.source || 'NOVA';
+    const msg = a.msg || '';
+    if (!msg) return;
+    const sig = `${sev}|${source}|${msg.slice(0,60)}`;
+    const now = Date.now();
+    if (alerts.bySig.has(sig)) {
+      const idx = alerts.bySig.get(sig);
+      const ex = alerts.queue[idx];
+      if (ex && (now - ex.lastTs) < alerts.cooldownMs) {
+        ex.count = (ex.count||1) + 1;
+        ex.lastTs = now;
+        renderAlertCenter();
+        renderBellBadge();
+        return;
+      }
+    }
+    const item = { id: alerts.nextId++, sev, source, msg, ts: now, lastTs: now, count: 1, ackd: false };
+    alerts.queue.unshift(item);
+    alerts.bySig.set(sig, 0);
+    // reindex bySig (positions shifted)
+    alerts.bySig.clear();
+    alerts.queue.forEach((it, i) => alerts.bySig.set(`${it.sev}|${it.source}|${it.msg.slice(0,60)}`, i));
+    // cap queue at 200
+    if (alerts.queue.length > 200) alerts.queue.length = 200;
+    renderBellBadge();
+    if (alerts.open) renderAlertCenter();
+    if (sev === 'critical') flashCriticalEdge();
+  }
+
+  function ackAlert(id) {
+    const it = alerts.queue.find(a => a.id === id);
+    if (it) { it.ackd = true; renderAlertCenter(); renderBellBadge(); }
+  }
+  function ackAll() { alerts.queue.forEach(a => a.ackd = true); renderAlertCenter(); renderBellBadge(); }
+  function clearAcked() {
+    alerts.queue = alerts.queue.filter(a => !a.ackd);
+    alerts.bySig.clear();
+    alerts.queue.forEach((it, i) => alerts.bySig.set(`${it.sev}|${it.source}|${it.msg.slice(0,60)}`, i));
+    renderAlertCenter(); renderBellBadge();
+  }
+
+  function flashCriticalEdge() {
+    let el = document.getElementById('ndm-edge-flash');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'ndm-edge-flash';
+      el.style.cssText = 'position:fixed;inset:0;z-index:9500;pointer-events:none;box-shadow:inset 0 0 80px rgba(239,68,68,0);transition:box-shadow .4s;';
+      document.body.appendChild(el);
+    }
+    el.style.boxShadow = 'inset 0 0 120px rgba(239,68,68,0.4)';
+    setTimeout(() => { el.style.boxShadow = 'inset 0 0 80px rgba(239,68,68,0)'; }, 500);
+  }
+
+  function renderBellBadge() {
+    const bell = document.getElementById('ndm-topbar-bell');
+    if (!bell) return;
+    const unackd = alerts.queue.filter(a => !a.ackd);
+    const crit = unackd.some(a => a.sev === 'critical');
+    bell.classList.toggle('has-alerts', unackd.length > 0);
+    bell.classList.toggle('has-crit', crit);
+    const badge = bell.querySelector('.ndm-topbar-bell-badge');
+    if (unackd.length > 0) {
+      if (badge) badge.textContent = String(unackd.length > 99 ? '99+' : unackd.length);
+      else {
+        const b = document.createElement('span');
+        b.className = 'ndm-topbar-bell-badge';
+        b.textContent = String(unackd.length);
+        bell.appendChild(b);
+      }
+    } else if (badge) badge.remove();
+
+  }
+
+  function renderAlertCenter() {
+    const ac = document.getElementById('ndm-alertcenter');
+    if (!ac) return;
+    const list = ac.querySelector('.ndm-alertcenter-list');
+    if (!list) return;
+    if (alerts.queue.length === 0) {
+      list.innerHTML = `<div class="ndm-alert-empty">No alerts · all clear ●</div>`;
+      return;
+    }
+    list.innerHTML = alerts.queue.map(a => {
+      const dt = new Date(a.lastTs);
+      const tstr = `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}:${String(dt.getSeconds()).padStart(2,'0')}`;
+      return `<div class="ndm-alert-row sev-${esc(a.sev)}${a.ackd?' ackd':''}">
+        <div class="ndm-alert-sev-bar"></div>
+        <div class="ndm-alert-body">
+          <div class="ndm-alert-meta"><b>${esc(a.source)}</b> · ${esc(a.sev.toUpperCase())} · ${tstr}${a.count>1?` · <span class="ndm-alert-cnt">×${a.count}</span>`:''}</div>
+          <div class="ndm-alert-msg">${esc(a.msg)}</div>
+        </div>
+        ${a.ackd ? '' : `<button class="ndm-alert-ack" data-ack="${a.id}">ACK</button>`}
+      </div>`;
+    }).join('');
+    list.querySelectorAll('button[data-ack]').forEach(b => {
+      b.onclick = () => ackAlert(parseInt(b.dataset.ack, 10));
+    });
+  }
+
+  function toggleAlertCenter(force) {
+    const ac = document.getElementById('ndm-alertcenter');
+    if (!ac) return;
+    const next = typeof force === 'boolean' ? force : !alerts.open;
+    alerts.open = next;
+    ac.classList.toggle('open', next);
+    if (next) renderAlertCenter();
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ═══ CHROME: top bar + alert center                         ═══
+  // ══════════════════════════════════════════════════════════════════════════
+
+  function injectChrome() {
+    if (prefs.chromeDisabled) return;
+    if (document.body.classList.contains('ndm-chrome-disabled')) return;
+    if (!document.getElementById('ndm-topbar')) injectTopBar();
+    if (!document.getElementById('ndm-alertcenter')) injectAlertCenter();
+    startClock();
+    startHeartbeatRender();
+  }
+
+  function injectTopBar() {
+    const bar = document.createElement('div');
+    bar.id = 'ndm-topbar';
+    bar.className = 'ndm-topbar';
+    bar.innerHTML = `
+      <div class="ndm-topbar-left">
+        <div class="ndm-topbar-brand">NOVA · COMMAND</div>
+        <canvas class="ndm-topbar-ecg" id="ndm-topbar-ecg" width="120" height="24"></canvas>
+      </div>
+      <div class="ndm-topbar-center">
+        <div class="ndm-topbar-clock" id="ndm-topbar-clock">00:00:00</div>
+        <div class="ndm-topbar-rate"><b id="ndm-topbar-rate">0.0</b> evt/s</div>
+        <div class="ndm-topbar-host" id="ndm-topbar-host">no host</div>
+      </div>
+      <div class="ndm-topbar-right">
+        <div class="ndm-topbar-chip warn" id="ndm-topbar-conn"><span class="dot"></span><span id="ndm-topbar-conn-txt">CONNECTING</span></div>
+        <div class="ndm-topbar-env" id="ndm-topbar-env">—</div>
+        <div class="ndm-topbar-bell" id="ndm-topbar-bell" title="Alerts">
+          <svg viewBox="0 0 24 24"><path d="M12 2a7 7 0 0 0-7 7v3.586l-1.707 1.707A1 1 0 0 0 4 16h16a1 1 0 0 0 .707-1.707L19 12.586V9a7 7 0 0 0-7-7zm0 20a3 3 0 0 0 3-3H9a3 3 0 0 0 3 3z"/></svg>
+        </div>
+        <div class="ndm-topbar-cog" id="ndm-topbar-cog" title="Settings">⚙</div>
+      </div>`;
+    document.body.appendChild(bar);
+    document.getElementById('ndm-topbar-bell').onclick = () => toggleAlertCenter();
+    document.getElementById('ndm-topbar-cog').onclick = () => {
+      document.body.classList.toggle('ndm-chrome-disabled');
+    };
+  }
+
+
+  function injectAlertCenter() {
+    const ac = document.createElement('div');
+    ac.id = 'ndm-alertcenter';
+    ac.className = 'ndm-alertcenter';
+    ac.innerHTML = `
+      <div class="ndm-alertcenter-hdr">
+        <span>◈ ALERT CENTER</span>
+        <div class="ndm-alertcenter-hdr-actions">
+          <button id="ndm-ac-ack-all">ACK ALL</button>
+          <button id="ndm-ac-clear">CLEAR ACKD</button>
+          <button id="ndm-ac-close">✕</button>
+        </div>
+      </div>
+      <div class="ndm-alertcenter-list"><div class="ndm-alert-empty">No alerts · all clear ●</div></div>`;
+    document.body.appendChild(ac);
+    ac.querySelector('#ndm-ac-ack-all').onclick = ackAll;
+    ac.querySelector('#ndm-ac-clear').onclick = clearAcked;
+    ac.querySelector('#ndm-ac-close').onclick = () => toggleAlertCenter(false);
+  }
+
+  let _clockTimer = null;
+  function startClock() {
+    if (_clockTimer) clearInterval(_clockTimer);
+    const tick = () => {
+      const el = document.getElementById('ndm-topbar-clock');
+      if (el) el.textContent = fmtTime();
+      const rateEl = document.getElementById('ndm-topbar-rate');
+      if (rateEl) rateEl.textContent = evtPerSec();
+      const hostEl = document.getElementById('ndm-topbar-host');
+      if (hostEl) hostEl.textContent = watchedHostId ? ('host: ' + String(watchedHostId).slice(0,16)) : 'no host';
+    };
+    tick(); _clockTimer = setInterval(tick, 1000);
+  }
+
+  let _hbTimer = null;
+  function startHeartbeatRender() {
+    if (_hbTimer) clearInterval(_hbTimer);
+    _hbTimer = setInterval(drawHeartbeatLine, 250);
+  }
+
+  function drawHeartbeatLine() {
+    const cv = document.getElementById('ndm-topbar-ecg');
+    if (!cv) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth || 120, h = cv.clientHeight || 24;
+    if (cv.width !== w*dpr) { cv.width = w*dpr; cv.height = h*dpr; }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,w,h);
+    // background grid
+    ctx.strokeStyle = 'rgba(34,211,238,0.06)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, h/2); ctx.lineTo(w, h/2);
+    ctx.stroke();
+
+    if (conn.rttCount === 0) {
+      ctx.fillStyle = '#475569'; ctx.font = '9px JetBrains Mono';
+      ctx.fillText('—', 4, h-6);
+      return;
+    }
+
+    // pull rtt ring linearly
+    const n = conn.rttCount;
+    const arr = new Float32Array(n);
+    for (let i=0;i<n;i++) {
+      const idx = (conn.rttHead - n + i + conn.rttRing.length) % conn.rttRing.length;
+      arr[i] = conn.rttRing[idx];
+    }
+    let mx = 1;
+    for (let i=0;i<n;i++) if (arr[i]>mx) mx = arr[i];
+    const stepX = w / Math.max(1, n-1);
+
+    // glow line
+    const color = conn.state === 'reconnecting' ? '#ef4444' :
+                  conn.state === 'stale'        ? '#f59e0b' : '#22c55e';
+    ctx.strokeStyle = color; ctx.lineWidth = 1.4;
+    ctx.shadowBlur = 6; ctx.shadowColor = color;
+    ctx.beginPath();
+    for (let i=0;i<n;i++) {
+      const x = i*stepX;
+      const y = h - 2 - (arr[i]/mx) * (h-6);
+      // ECG-like spike: every 4th sample lift
+      const spike = (i%4===0 && arr[i] > 0) ? -3 : 0;
+      if (i===0) ctx.moveTo(x, y+spike);
+      else ctx.lineTo(x, y+spike);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  function updateConnChip() {
+    const chip = document.getElementById('ndm-topbar-conn');
+    const txt = document.getElementById('ndm-topbar-conn-txt');
+    if (!chip || !txt) return;
+    chip.classList.remove('warn','crit');
+    let label = 'IDLE';
+    switch (conn.state) {
+      case 'connecting': chip.classList.add('warn'); label = 'CONNECTING'; break;
+      case 'open':       label = `LIVE · ${conn.lastLatency ? Math.round(conn.lastLatency)+'ms' : '—'}`; break;
+      case 'stale':      chip.classList.add('warn'); label = `STALE · ${Math.round((Date.now()-(conn.staleSince||Date.now()))/1000)}s`; break;
+      case 'reconnecting': chip.classList.add('crit'); label = `RECONNECTING · #${conn.reconnectAttempts}`; break;
+      case 'dead':       chip.classList.add('crit'); label = 'DISCONNECTED'; break;
+    }
+    txt.textContent = label;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ═══ SPARKLINES (in metric chips)                                       ═══
+  // ══════════════════════════════════════════════════════════════════════════
+
+  function drawSparkline(cv, arr, color) {
+    if (!cv) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth || 80, h = cv.clientHeight || 18;
+    if (cv.width !== w*dpr) { cv.width = w*dpr; cv.height = h*dpr; }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,w,h);
+    if (!arr || arr.length === 0) return;
+    let mx = 0;
+    for (let i=0;i<arr.length;i++) if (arr[i]>mx) mx = arr[i];
+    if (mx <= 0) mx = 1;
+    const stepX = w / Math.max(1, arr.length-1);
+    // fill gradient
+    const grd = ctx.createLinearGradient(0,0,0,h);
+    grd.addColorStop(0, hexA(color, 0.55));
+    grd.addColorStop(1, hexA(color, 0));
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.moveTo(0, h);
+    for (let i=0;i<arr.length;i++) {
+      const x = i*stepX;
+      const y = h - (arr[i]/mx) * (h-2) - 1;
+      ctx.lineTo(x, y);
+    }
+    ctx.lineTo(w, h);
+    ctx.closePath();
+    ctx.fill();
+    // line
+    ctx.strokeStyle = color; ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    for (let i=0;i<arr.length;i++) {
+      const x = i*stepX;
+      const y = h - (arr[i]/mx) * (h-2) - 1;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
+  function hexA(hex, a) {
+    if (hex.startsWith('rgb')) return hex.replace(')',`,${a})`).replace('rgb','rgba');
+    const m = /^#([0-9a-f]{6})$/i.exec(hex);
+    if (!m) return `rgba(34,211,238,${a})`;
+    const n = parseInt(m[1], 16);
+    return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+  }
+  function trendLabel(arr) {
+    if (!arr || arr.length < 6) return {cls:'flat', txt:'—'};
+    const half = Math.floor(arr.length/2);
+    let a=0,b=0;
+    for (let i=0;i<half;i++) a += arr[i];
+    for (let i=half;i<arr.length;i++) b += arr[i];
+    a /= half; b /= (arr.length-half);
+    if (a === 0 && b === 0) return {cls:'flat', txt:'—'};
+    const d = (b - a) / Math.max(1, a);
+    if (d > 0.08) return {cls:'up', txt:`▲ ${Math.abs(d*100).toFixed(0)}%`};
+    if (d < -0.08) return {cls:'down', txt:`▼ ${Math.abs(d*100).toFixed(0)}%`};
+    return {cls:'flat', txt:'≈'};
+  }
+
+  function updateFastSparklines(panel, diskName, hostId) {
+    if (!panel || !hostRings[hostId]) return;
+    const r = hostRings[hostId];
+    const seriesMap = {
+      frc:    { ring:r.rkBs,   color:'#22d3ee' },
+      fwc:    { ring:r.wkBs,   color:'#818cf8' },
+      flat:   { ring:r.rAwait, color:'#f59e0b' },
+      fiops:  { ring:r.rIops,  color:'#22c55e' },
+      futil:  { ring:r.util,   color:'#a855f7' },
+      fque:   { ring:r.aqu,    color:'#f97316' },
+    };
+    Object.keys(seriesMap).forEach(k => {
+      const cv = panel.querySelector(`#ndm3-cv-spark-${k}-${diskName}`);
+      const tr = panel.querySelector(`#ndm3-cv-trend-${k}-${diskName}`);
+      if (!cv) return;
+      const arr = orderedRing(seriesMap[k].ring, r.head, r.count);
+      drawSparkline(cv, arr, seriesMap[k].color);
+      if (tr) { const t = trendLabel(arr); tr.className = `ndm3-chip-trend ${t.cls}`; tr.textContent = t.txt; }
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ═══ VIRTUALIZED LOG TERMINAL                                          ═══
+  // ══════════════════════════════════════════════════════════════════════════
+
+  const logVirt = {}; // per-disk virtualized log state
+  const LOG_LINE_H = 18;
+
+  function attachVirtLog(panel, diskName, scope) {
+    // scope: 'deep' | 'fast' | 'virt'
+    const box = panel.querySelector(`#ndm-${scope}-log-${diskName}`);
+    if (!box) return;
+    box.classList.add('ndm3-log-virt');
+    box.innerHTML = `<div class="ndm3-log-virt-spacer" style="height:0"></div>
+      <div class="ndm3-log-jump" id="ndm-log-jump-${diskName}">↓ NEW</div>`;
+    logVirt[diskName] = {
+      box, scope, scrollLocked: false,
+      visibleSet: new Set(),
+    };
+    box.addEventListener('scroll', () => {
+      const st = logVirt[diskName]; if (!st) return;
+      const distFromBottom = box.scrollHeight - box.scrollTop - box.clientHeight;
+      st.scrollLocked = distFromBottom > 100;
+      if (!st.scrollLocked) {
+        const jump = box.querySelector(`#ndm-log-jump-${diskName}`);
+        if (jump) jump.classList.remove('show');
+      }
+      renderVirtLog(diskName);
+    });
+    const jump = box.querySelector(`#ndm-log-jump-${diskName}`);
+    if (jump) jump.onclick = () => {
+      box.scrollTop = box.scrollHeight;
+      const st = logVirt[diskName]; if (st) st.scrollLocked = false;
+      jump.classList.remove('show');
+    };
+    renderVirtLog(diskName);
+  }
+
+  function filteredLogs(diskName) {
+    const fil = logFilters[diskName] || 'ALL';
+    const search = (logSearch[diskName]||'').toLowerCase();
+    return logBuf.filter(l => {
+      if (l.disk && l.disk !== diskName) return false;
+      if (fil !== 'ALL' && l.tag !== fil) return false;
+      if (search && !(l.msg||'').toLowerCase().includes(search)) return false;
+      return true;
+    });
+  }
+
+  function renderVirtLog(diskName) {
+    const st = logVirt[diskName]; if (!st || !st.box) return;
+    const box = st.box;
+    const arr = filteredLogs(diskName);
+    const spacer = box.querySelector('.ndm3-log-virt-spacer');
+    if (!spacer) return;
+    spacer.style.height = (arr.length * LOG_LINE_H) + 'px';
+    const total = arr.length;
+    const viewH = box.clientHeight;
+    const scrollTop = box.scrollTop;
+    const first = Math.max(0, Math.floor(scrollTop / LOG_LINE_H) - 4);
+    const visibleCount = Math.ceil(viewH / LOG_LINE_H) + 8;
+    const last = Math.min(total, first + visibleCount);
+    // diff render: remove old, draw new
+    const search = (logSearch[diskName]||'').toLowerCase();
+    let html = '';
+    for (let i=first; i<last; i++) {
+      const l = arr[i];
+      const dt = new Date(l.ts);
+      const ts = `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}:${String(dt.getSeconds()).padStart(2,'0')}`;
+      let msg = esc(l.msg||'');
+      if (search) {
+        const re = new RegExp('('+search.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');
+        msg = msg.replace(re, '<mark>$1</mark>');
+      }
+      const lvl = (l.level||'info').toLowerCase();
+      html += `<div class="ndm3-log-virt-row ${esc(lvl)}" style="top:${i*LOG_LINE_H}px">
+        <span class="ts">${ts}</span>${l.tag?`<span class="tag">[${esc(l.tag)}]</span>`:''}${msg}
+      </div>`;
+    }
+    // remove existing rows, add new
+    Array.from(box.querySelectorAll('.ndm3-log-virt-row')).forEach(r => r.remove());
+    if (html) {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = html;
+      while (tmp.firstChild) spacer.appendChild(tmp.firstChild);
+    }
+  }
+
+  function appendLogVirt(diskName, level, msg, tsMs) {
+    const ts = tsMs || Date.now();
+    const tag = extractTag(msg);
+    logBuf.push({ level, msg, ts, tag, disk: diskName });
+    while (logBuf.length > LOG_MAX) logBuf.shift();
+    const st = logVirt[diskName];
+    if (!st || !st.box) return;
+    // re-render only if filter matches (we always re-render virt window cheaply)
+    renderVirtLog(diskName);
+    if (st.scrollLocked) {
+      const jump = st.box.querySelector(`#ndm-log-jump-${diskName}`);
+      if (jump) jump.classList.add('show');
+    } else {
+      st.box.scrollTop = st.box.scrollHeight;
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ═══ LVM FLOW & FILESYSTEM RADIAL RINGS                                ═══
+  // ══════════════════════════════════════════════════════════════════════════
+
+  function renderLvmFlow(el, lvm) {
+    if (!el) return;
+    const panel = el.closest('.ndm3');
+    const diskName = panel ? panel.dataset.disk : null;
+    const emptyEl = diskName ? panel.querySelector(`#ndm-deep-lvm-empty-${diskName}`) : null;
+    if (!lvm || (!lvm.pvs && !lvm.vgs && !lvm.lvs)) {
+      el.innerHTML = ''; el.style.display='none';
+      if (emptyEl) emptyEl.style.display='';
+      return;
+    }
+    if (emptyEl) emptyEl.style.display='none';
+    el.style.display = 'flex';
+    const pvs = lvm.pvs||[], vgs = lvm.vgs||[], lvs = lvm.lvs||[];
+    const col = (title, items) => `<div class="ndm3-lvm-col">
+      <div class="ndm3-lvm-col-hdr">${title}</div>
+      ${items.length === 0 ? '<div class="ndm3-lvm-node" style="opacity:.5">—</div>' : items.map(i=>`
+        <div class="ndm3-lvm-node">
+          <div class="ndm3-lvm-node-name">${esc(i.name)}</div>
+          <div class="ndm3-lvm-node-meta">${esc(i.meta||'')}</div>
+          ${typeof i.usage === 'number' ? `<div class="ndm3-lvm-node-bar"><div class="ndm3-lvm-node-bar-fill" style="width:${Math.min(100,Math.max(0,i.usage))}%"></div></div>` : ''}
+        </div>`).join('')}
+    </div>`;
+    const arr = '<div class="ndm3-lvm-arrow">→</div>';
+    const pvI = pvs.map(p => ({ name: p.pv_name||p.name||'pv', meta: (p.pv_size||p.size||'') + (p.vg_name?' · '+p.vg_name:'') }));
+    const vgI = vgs.map(v => ({ name: v.vg_name||v.name||'vg', meta: (v.vg_size||v.size||'') + (v.vg_free?' · free '+v.vg_free:''), usage: v.vg_size && v.vg_free ? (1 - parseUnit(v.vg_free)/parseUnit(v.vg_size))*100 : null }));
+    const lvI = lvs.map(l => ({ name: l.lv_name||l.name||'lv', meta: (l.lv_size||l.size||'') + (l.vg_name?' · '+l.vg_name:''), usage: l.data_percent ? Number(l.data_percent) : null }));
+    el.innerHTML = col('PHYSICAL VOLUMES', pvI) + arr + col('VOLUME GROUPS', vgI) + arr + col('LOGICAL VOLUMES', lvI);
+  }
+  function parseUnit(s) {
+    if (typeof s === 'number') return s;
+    s = String(s||'').trim();
+    const m = /^([\d.]+)\s*([KMGTPE]?)/i.exec(s);
+    if (!m) return 0;
+    const n = Number(m[1])||0;
+    const u = (m[2]||'').toUpperCase();
+    const mult = { '':1, K:1e3, M:1e6, G:1e9, T:1e12, P:1e15, E:1e18 }[u]||1;
+    return n*mult;
+  }
+
+  function renderFsRings(el, filesystems) {
+    if (!el) return;
+    if (!filesystems || filesystems.length === 0) { el.innerHTML=''; return; }
+    el.innerHTML = filesystems.slice(0,16).map((fs,i) => `
+      <div class="ndm3-fs-ring">
+        <canvas id="ndm-fs-ring-${i}" width="64" height="64"></canvas>
+        <div class="ndm3-fs-ring-name" title="${esc(fs.mount||fs.mountpoint||fs.target||'')}">${esc(fs.mount||fs.mountpoint||fs.target||'?')}</div>
+        <div class="ndm3-fs-ring-meta">${esc(fs.used||'')} / ${esc(fs.size||'')}</div>
+      </div>`).join('');
+    filesystems.slice(0,16).forEach((fs,i) => {
+      const cv = el.querySelector(`#ndm-fs-ring-${i}`);
+      if (!cv) return;
+      const pct = fs.use_pct != null ? Number(fs.use_pct) :
+                  fs.use != null ? parseFloat(String(fs.use).replace('%','')) : 0;
+      drawFsRing(cv, isFinite(pct) ? pct : 0);
+    });
+  }
+  function drawFsRing(cv, pct) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth || 64, h = cv.clientHeight || 64;
+    if (cv.width !== w*dpr) { cv.width = w*dpr; cv.height = h*dpr; }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,w,h);
+    const cx = w/2, cy = h/2, r = Math.min(w,h)*0.36;
+    // background
+    ctx.strokeStyle = 'rgba(56,189,248,0.12)'; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.arc(cx,cy,r, 0, Math.PI*2); ctx.stroke();
+    // fill arc
+    const color = pct > 90 ? '#ef4444' : pct > 75 ? '#f59e0b' : '#22d3ee';
+    ctx.strokeStyle = color; ctx.lineWidth = 6;
+    ctx.shadowBlur = 8; ctx.shadowColor = color;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, -Math.PI/2, -Math.PI/2 + (Math.PI*2*Math.min(100,Math.max(0,pct))/100));
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    // text
+    ctx.fillStyle = color; ctx.font = 'bold 13px JetBrains Mono';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(Math.round(pct)+'%', cx, cy);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ═══ ANOMALY STREAM (feeds alerts from live IO)                        ═══
+  // ══════════════════════════════════════════════════════════════════════════
+
+  const anomState = {}; // per-hostId rolling anomaly tracker
+  function checkAnomalies(hostId, cur, tempC) {
+    const s = anomState[hostId] = anomState[hostId] || { utilHigh:0, queueHigh:0, tempWarned:false };
+    const lat = Math.max(cur.rAwait||0, cur.wAwait||0);
+
+    if (lat > 100) pushAlert({ sev:'warning', source:'LATENCY', msg:`I/O latency spike on host ${hostId}: ${lat.toFixed(0)}ms` });
+    if ((cur.aqu||0) > 8) { s.queueHigh++; if (s.queueHigh > 3) { pushAlert({ sev:'warning', source:'QUEUE', msg:`Queue depth sustained > 8 (avg ${(cur.aqu).toFixed(1)})` }); s.queueHigh = 0; } }
+    else s.queueHigh = Math.max(0, s.queueHigh-1);
+
+    if ((cur.util||0) > 95) { s.utilHigh++; if (s.utilHigh > 4) { pushAlert({ sev:'warning', source:'THROUGHPUT', msg:`Disk utilization sustained > 95% on host ${hostId}` }); s.utilHigh = 0; } }
+    else s.utilHigh = Math.max(0, s.utilHigh-1);
+
+    if (tempC > 60 && !s.tempWarned) {
+      pushAlert({ sev:'critical', source:'TEMP', msg:`Disk temperature critical: ${tempC}°C` });
+      s.tempWarned = true;
+    } else if (tempC > 0 && tempC < 55) {
+      s.tempWarned = false;
+    }
+  }
+
+  // ── Socket Connection ─────────────────────────────────────────────────────
+  function connectSocket() {
+    const tryConnect = () => {
+      if (!window.io) { setTimeout(tryConnect,300); return; }
+      const token = localStorage.getItem('token')||localStorage.getItem('nova_token')||'';
+      conn.state = 'connecting'; updateConnChip();
+      sock = window.io({ auth:{token}, transports:['websocket','polling'], reconnection:true, reconnectionDelay:1000, reconnectionDelayMax:30000 });
+
+      sock.on('connect', () => {
+        conn.state = 'open';
+        conn.lastBeat = Date.now();
+        conn.reconnectAttempts = 0;
+        if (conn.reconnectTimer) { clearTimeout(conn.reconnectTimer); conn.reconnectTimer = null; }
+        updateConnChip();
+        startHeartbeat();
+        startStaleWatcher();
+        pushAlert({ sev:'success', source:'CONN', msg:'WebSocket established · streaming telemetry' });
+        if (watchedHostId) sock.emit('disk:watch:start', {hostId:watchedHostId});
+      });
+
+      sock.on('disconnect', (reason) => {
+        conn.state = 'reconnecting';
+        updateConnChip();
+        if (conn.heartbeatTimer) { clearInterval(conn.heartbeatTimer); conn.heartbeatTimer = null; }
+        Object.values(panels).forEach(p => p && p.classList.add('stale'));
+        Object.values(fastPanels).forEach(p => p && p.classList.add('stale'));
+        pushAlert({ sev:'warning', source:'CONN', msg:`Disconnected: ${reason}` });
+      });
+
+      sock.on('connect_error', (err) => {
+        conn.reconnectAttempts++;
+        updateConnChip();
+      });
+
+      sock.on('ndm:pong', (data) => {
+        markBeat();
+        const rtt = Date.now() - (data && data.ts ? data.ts : conn.pingSentAt);
+        if (rtt > 0 && rtt < 30000) pushRtt(rtt);
+        updateConnChip();
+      });
+
+      // any inbound message counts as a beat
+      sock.onAny(() => { markBeat(); });
+
+      // ── Fast scan trigger ──
+      sock.on('scan:start', data => {
+        if ((data.scan_type||'fast')==='fast') {
+          watchedHostId = watchedHostId||data.hostId;
+          sock.emit('disk:watch:start', {hostId:data.hostId});
+        }
+      });
+
+      // ── Scan progress → deep scan panel ──
+      sock.on('scan:progress', data => {
+        const {diskName, hostId, jobId, progress} = data;
+        if (!diskName) return;
+        if (jobId && typeof progress === 'number') trackPacketLoss(jobId, progress);
+        watchedHostId = watchedHostId||hostId;
+
+        if (!panels[diskName]) injectDeepPanel(diskName, hostId, jobId);
+
+        const panel = panels[diskName];
+        const state = scans[diskName];
+        if (!panel||!state) return;
+
+        state.progress = progress;
+        updateHeader(panel, diskName, progress, state.startTs);
+
+        // update surface
+        const ring = hostRings[hostId]||{rAwait:new Float32Array(RING),head:0};
+        const latestLat = ring.rAwait[(ring.head-1+RING)%RING]||0;
+        updateSurface(state, progress, latestLat);
+        const surfCv = panel.querySelector(`#cv-surf-${diskName}`);
+        if (surfCv) drawSurface(surfCv, state);
+      });
+
+      // ── Scan complete ──
+      sock.on('scan:complete', data => {
+        const {diskName, hostId, result} = data;
+        if (!diskName||!result) return;
+        watchedHostId = watchedHostId||hostId;
+
+        const stype = result.scan_type||'';
+        const sevOK = (result.isAtRisk || result.failed) ? 'warning' : 'success';
+        pushAlert({ sev:sevOK, source:'SCAN', msg:`${stype.toUpperCase()||'scan'} complete on ${diskName} — health: ${result.overall_health||(result.failed?'FAIL':'PASSED')}` });
+        if (result.isAtRisk) pushAlert({ sev:'critical', source:'SMART', msg:`Disk ${diskName} flagged AT-RISK by analyzer` });
+
+        if (stype==='deep'||panels[diskName]) {
+          // deep scan finalization
+          finalizeDeepScan(panels[diskName], diskName, hostId, result);
+          return;
+        }
+
+        // fast scan
+        if (result.smartFallback || result.smartStatus==='N/A' || result.virtualization) {
+          injectVirtPanel(diskName, hostId, result);
+        } else {
+          injectFastPanel(diskName, hostId, result);
+        }
+      });
+
+      // ── Scan log ──
+      sock.on('scan:log', data => {
+        const {hostId, level, message, diskName: dn} = data;
+        const allDisks = new Set([
+          ...Object.keys(panels),
+          ...Object.keys(fastPanels)
+        ]);
+        allDisks.forEach(d => {
+          const panel = panels[d]||fastPanels[d];
+          if (panel) appendLog(panel, d, level||'info', message||'');
+        });
+        if (level === 'error') pushAlert({ sev:'critical', source:'KERNEL', msg: message||'unknown error' });
+        else if (level === 'warn') pushAlert({ sev:'warning', source:'SCAN', msg: message||'' });
+      });
+
+      // ── Server Scan events ──
+      sock.on('server:scan:start', data => {
+        scanServer.scanning = true;
+        scanServer.startTs = Date.now();
+        scanServer.findings = [];
+        scanServer.progress = 0;
+        ssLogBuf.length = 0;
+        startSsDurTicker();
+        updateSsStatus();
+        renderSsFindings();
+        const pg = document.getElementById('ndm-ss-progress-bar');
+        if (pg) pg.style.width = '0%';
+      });
+      sock.on('server:scan:progress', data => {
+        scanServer.progress = data.pct || 0;
+        updateSsProgress(data);
+      });
+      sock.on('server:scan:log', data => {
+        pushSsLog(data.level || 'info', data.message || '', data.ts || Date.now());
+      });
+      sock.on('server:scan:finding', finding => {
+        scanServer.findings.push(finding);
+        renderSsFindings();
+        updateSsAIPanel();
+	      });
+      sock.on('server:scan:history', histArr => {
+        scanServer.history = histArr || [];
+        renderSsHistory(scanServer.history);
+      });
+      sock.on('server:scan:scheduled', data => {
+        if (!scanServer.scanning) startServerScan(data.mode || scanServer.mode);
+      });
+
+      sock.on('server:scan:complete', data => {
+        scanServer.scanning = false;
+        scanServer.health = data.health || 'HEALTHY';
+        scanServer.progress = 100;
+        if (scanServer._durTimer) { clearInterval(scanServer._durTimer); scanServer._durTimer = null; }
+        updateSsStatus();
+        renderSsFindings();
+        updateSsAIPanel();
+        const pg = document.getElementById('ndm-ss-progress-bar');
+        if (pg) pg.style.width = '100%';
+        const critN = (data.findings||[]).filter(f=>f.sev==='critical').length;
+        const warnN = (data.findings||[]).filter(f=>f.sev==='warning').length;
+        pushAlert({
+          sev: data.health==='CRITICAL' ? 'critical' : data.health==='WARNING' ? 'warning' : 'success',
+          source: 'SCAN-SERVER',
+          msg: `Server scan complete · ${(data.findings||[]).length} findings · ${critN} critical · ${warnN} warnings`
+	      });
+        });
+
+      // ── Live IO telemetry ──
+      sock.on('disk:io:live', data => {
+        const {hostId, ioStats, disks, partitions, lvm} = data;
+        if (!hostId) return;
+
+        // find temperature from disks array
+        let tempC = 0;
+        (disks||[]).forEach(d => { if (d.temperature>0) tempC=d.temperature; });
+
+        const cur = pushRing(hostId, ioStats, tempC);
+
+        // update deep scan panels for this host
+        Object.keys(panels).forEach(diskName => {
+          const panel = panels[diskName];
+          const state = scans[diskName];
+          if (!panel||!state||state.hostId!==hostId) return;
+
+          updateDeepMetrics(panel, diskName, {...cur, temp:tempC});
+          redrawDeepCharts(panel, diskName, hostId);
+
+          // anomaly detection
+          const lat = Math.max(cur.rAwait,cur.wAwait);
+          if (lat>30||cur.util>85) state.ioAnomaly = {latency:lat, util:cur.util};
+
+          // topology
+          updateDeepTopology(panel, diskName, {disks, partitions, lvm});
+
+          // anomaly log
+          if (lat>80) appendLog(panel, diskName, 'warn', `[I/O] Read latency spike: ${lat.toFixed(0)}ms`);
+          if (cur.util>90) appendLog(panel, diskName, 'warn', `[I/O] Disk utilization critical: ${cur.util.toFixed(0)}%`);
+
+          // surface update if scan active
+          if (state.progress<100) {
+            updateSurface(state, state.progress, cur.rAwait);
+            const surfCv = panel.querySelector(`#cv-surf-${diskName}`);
+            if (surfCv) drawSurface(surfCv, state);
+          }
+        });
+
+        // update fast/virt panels for this host
+        Object.keys(fastPanels).forEach(diskName => {
+          const panel = fastPanels[diskName];
+          if (!panel) return;
+          // detect prefix (fast or virt)
+          const isFast = !!panel.id && panel.id.startsWith('ndm-fast-');
+          const prefix = isFast ? 'f' : 'v';
+          updateFastStrip(panel, diskName, prefix, cur);
+          redrawFastCharts(isFast?'fcv':'vcv', diskName, hostId);
+          updateFastSparklines(panel, diskName, hostId);
+        });
+
+        // anomaly detector → alerts
+        checkAnomalies(hostId, cur, tempC);
+      });
+
+      // ── Hosts update (for topology) ──
+      sock.on('hosts_update', hosts => {
+        window.__nova_hosts = hosts;
+        // pick environment for badge
+        const hid = watchedHostId;
+        if (hid && hosts[hid]) {
+          const env = hosts[hid].virtualization || hosts[hid].virt || (hosts[hid].virt_type) || 'BARE-METAL';
+          const eEl = document.getElementById('ndm-topbar-env');
+          if (eEl) eEl.textContent = String(env).toUpperCase().slice(0,16);
+        }
+        Object.keys(panels).forEach(diskName => {
+          const state = scans[diskName];
+          if (!state) return;
+          const hostData = hosts[state.hostId];
+          if (!hostData) return;
+          updateDeepTopology(panels[diskName], diskName, hostData);
+          // LVM flow
+          const lvmEl = panels[diskName].querySelector(`#ndm-deep-lvm-${diskName}`);
+          if (lvmEl) renderLvmFlow(lvmEl, hostData.lvm);
+          // FS rings
+          const fsEl = panels[diskName].querySelector(`#ndm-deep-fsrings-${diskName}`);
+          if (fsEl) renderFsRings(fsEl, hostData.filesystems);
+          const tempC = (hostData.disks||[]).reduce((t,d)=>d.temperature>0?d.temperature:t,0);
+          if (tempC && hostRings[state.hostId]) {
+            const r = hostRings[state.hostId];
+            r.temp[(r.head-1+RING)%RING] = tempC;
+          }
+        });
+        Object.keys(fastPanels).forEach(diskName => {
+          const panel = fastPanels[diskName];
+          if (!panel) return;
+          // try to find hostId from scans or watchedHostId
+          const hostId = watchedHostId;
+          if (!hostId||!hosts[hostId]) return;
+          const hostData = hosts[hostId];
+          const diskInfo = (hostData.disks||[]).find(d=>d.name===diskName)||{};
+          const rows = buildTopology(diskName, diskInfo, hostData.partitions, hostData.lvm);
+          const treeEl = panel.querySelector(`#ndm-fast-tree-${diskName}`) ||
+                         panel.querySelector(`#ndm-virt-tree-${diskName}`);
+          if (treeEl) renderTopology(treeEl, rows);
+        });
+      });
+    };
+    tryConnect();
+  }
+
+  // ── Host data helper ───────────────────────────────────────────────────────
+  function getHostData(hostId) {
+    // Try to get from window.__nova_hosts if available
+    if (window.__nova_hosts && window.__nova_hosts[hostId]) return window.__nova_hosts[hostId];
+    return null;
+  }
+
+  // ── Mini HTML builders ─────────────────────────────────────────────────────
+  function mc(id, lbl, val, sub, cls, diskName) {
+    const spark = diskName ? `<canvas class="ndm3-chip-spark" id="ndm3-cv-spark-${id}-${diskName}" height="18"></canvas>` : '';
+    const trend = diskName ? `<span class="ndm3-chip-trend flat" id="ndm3-cv-trend-${id}-${diskName}">—</span>` : '';
+    return `<div class="ndm3-chip">
+      ${trend}
+      <div class="ndm3-chip-lbl">${lbl}</div>
+      <div class="ndm3-chip-val ${cls}" id="ndm3-cv-${id}">${val}</div>
+      <div class="ndm3-chip-sub ndm3-c-muted">${sub}</div>
+      ${spark}
+    </div>`;
+  }
+
+  function mbox(id, lbl, val, unit, cls) {
+    return `<div class="ndm3-metric-box">
+      <div class="ndm3-metric-box-lbl">${lbl}</div>
+      <div class="ndm3-metric-box-val ${cls}" id="${id}-val">${val}</div>
+      <div class="ndm3-metric-box-sub ndm3-c-muted" id="${id}-sub">${unit}</div>
+    </div>`;
+  }
+
+  function ch(id, lbl) {
+    return `<div class="ndm3-chart-wrap">
+      <div class="ndm3-chart-title">${lbl}</div>
+      <canvas id="${id}" height="80"></canvas>
+    </div>`;
+  }
+
+  function logFilter(name, active) {
+    return `<button class="ndm3-log-filter${active?' active':''}" data-filter="${name}">${name}</button>`;
+  }
+
+  function problemCol(id, title, type) {
+    return `<div class="ndm3-problem-col">
+      <div class="ndm3-problem-col-hdr ndm3-problem-hdr-${type}">${title}</div>
+      <div id="${id}"></div>
+    </div>`;
+  }
+
+  // ── DOM Set Helpers ────────────────────────────────────────────────────────
+  function setTxt(panel, sel, txt, attrs) {
+    const el = panel.querySelector(sel);
+    if (!el) return;
+    if (txt!=null) el.textContent = txt;
+    if (attrs&&attrs.style) el.style.cssText += ';'+attrs.style;
+  }
+
+  function setMbox(panel, id, val, unit, cls) {
+    const vEl = panel.querySelector(`#${id}-val`);
+    const uEl = panel.querySelector(`#${id}-sub`);
+    if (vEl) { vEl.textContent = val; if (cls) vEl.className = `ndm3-metric-box-val ${cls}`; }
+    if (uEl) uEl.textContent = unit;
+  }
+
+  function setChip(panel, id, val, cls) {
+    const el = panel.querySelector(`#ndm3-cv-${id}`);
+    if (!el) return;
+    el.textContent = val;
+    if (cls) el.className = `ndm3-chip-val ${cls}`;
+  }
+
+  // ── Utilities ──────────────────────────────────────────────────────────────
+  function esc(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+  function fmtTime() {
+    const d=new Date();
+    return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+  }
+  function fmtNum(n) {
+    n=Number(n)||0;
+    if (n>=1e6) return (n/1e6).toFixed(1)+'M';
+    if (n>=1e3) return (n/1e3).toFixed(1)+'k';
+    return n.toFixed(n<10?1:0);
+  }
+  function fmtSec(s) {
+    s=Math.max(0,s||0);
+    return `${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+  }
+
+  // ── Boot ───────────────────────────────────────────────────────────────────
+  window._ndmRemoveAll = () => {
+    Object.keys(panels).forEach(d=>{ panels[d]&&panels[d].remove(); delete panels[d]; });
+    Object.keys(fastPanels).forEach(d=>{ fastPanels[d]&&fastPanels[d].remove(); delete fastPanels[d]; });
+    Object.keys(overlays).forEach(d=>deactivateAnalysisMode(d));
+  };
+  window._ndmSetHost = (id) => {
+    watchedHostId = id;
+    if (sock && id) sock.emit('disk:watch:start', {hostId:id});
+  };
+  window._ndmAlert = pushAlert;
+  window._ndmToggleChrome = () => document.body.classList.toggle('ndm-chrome-disabled');
+  window._ndmScanServer = { show: showScanServer, hide: hideScanServer, scan: startServerScan };
+
+  function boot() {
+    injectCSS();
+    if (document.body) injectChrome();
+    else document.addEventListener('DOMContentLoaded', injectChrome, { once:true });
+    connectSocket();
+    updateConnChip();
+  }
+  boot();
+
+})();

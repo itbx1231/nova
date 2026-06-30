@@ -1,0 +1,1 @@
+const { Server } = require('socket.io'); const io = new Server(3020); io.on('connection', s => { s.hostId = 'test'; s.isAgent = true; console.log(Array.from(io.sockets.sockets.values()).find(x => x.hostId === 'test')); process.exit(0); }); const { io: client} = require('socket.io-client'); client('http://localhost:3020');

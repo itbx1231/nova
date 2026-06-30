@@ -1,0 +1,116 @@
+{
+  "ts": 1780830379901,
+  "jobId": "mq3ofey5es0r",
+  "hostId": "localhost",
+  "mode": "services",
+  "overallScore": 99,
+  "health": "HEALTHY",
+  "subsystems": {
+    "cpu": {
+      "score": 100,
+      "label": "CPU",
+      "value": "0.02 load"
+    },
+    "memory": {
+      "score": 92,
+      "label": "Memory",
+      "value": "8% used"
+    },
+    "disk": {
+      "score": 100,
+      "label": "Disk",
+      "value": "0 critical"
+    },
+    "network": {
+      "score": 100,
+      "label": "Network",
+      "value": "0% loss · DNS ok"
+    },
+    "services": {
+      "score": 100,
+      "label": "Services",
+      "value": "0 failed"
+    },
+    "security": {
+      "score": 100,
+      "label": "Security",
+      "value": "fw · 0 SSH risk"
+    },
+    "logs": {
+      "score": 100,
+      "label": "Logs",
+      "value": "0 errors"
+    },
+    "kernel": {
+      "score": 100,
+      "label": "Kernel",
+      "value": "0 errors"
+    },
+    "docker": {
+      "score": 100,
+      "label": "Docker",
+      "value": "not installed"
+    },
+    "database": {
+      "score": 100,
+      "label": "Database",
+      "value": "none detected"
+    }
+  },
+  "rootCause": {
+    "summary": "System appears healthy. No significant issues detected across all subsystems.",
+    "confidence": 92
+  },
+  "correlations": [
+    "No cascading failure patterns detected — subsystems are operating independently"
+  ],
+  "findings": {
+    "critical": [],
+    "warnings": [],
+    "info": [
+      {
+        "area": "System",
+        "msg": "No significant issues — system operating normally"
+      }
+    ]
+  },
+  "recommendations": [
+    {
+      "priority": "LOW",
+      "action": "Continue monitoring",
+      "cmd": "journalctl -f"
+    }
+  ],
+  "raw": {
+    "kernelErrors": [],
+    "recentLogs": [],
+    "failedServices": [],
+    "openPorts": [],
+    "diskStatus": "",
+    "raidInfo": null,
+    "containers": [],
+    "databases": {},
+    "security": {
+      "sshWeak": [],
+      "worldWritable": [],
+      "sudoNopasswd": [],
+      "suspiciousSuid": [],
+      "harden": null
+    },
+    "topErrors": [],
+    "crashSignals": {
+      "segfaults": 0,
+      "coreDumps": 0,
+      "timeouts": 0
+    },
+    "kernelHardware": {
+      "mce": [],
+      "hungTasks": []
+    },
+    "fsErrors": [],
+    "network": {
+      "tlsCerts": [],
+      "ifErrors": []
+    }
+  }
+}
