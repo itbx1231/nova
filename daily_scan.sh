@@ -17,3 +17,4 @@ for i in $(seq 1 60); do
   fi
 done
 echo "[$(date -Is)] daily scan: timed out waiting for report"; exit 1
+node /opt/nova/backend/services/aiExplainer.js

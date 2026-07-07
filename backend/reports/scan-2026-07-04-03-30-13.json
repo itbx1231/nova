@@ -1,20 +1,20 @@
 {
-  "ts": 1780754144646,
-  "jobId": "mq2f16dk9j3o",
-  "hostId": "localhost",
+  "ts": 1783135813185,
+  "jobId": "mr5t0mud577s",
+  "hostId": "ssh-172.12.26.127",
   "mode": "deep",
   "overallScore": 90,
   "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 98,
+      "score": 99,
       "label": "CPU",
-      "value": "0.17 load"
+      "value": "0.07 load"
     },
     "memory": {
-      "score": 92,
+      "score": 91,
       "label": "Memory",
-      "value": "8% used"
+      "value": "9% used"
     },
     "disk": {
       "score": 100,
@@ -39,7 +39,7 @@
     "logs": {
       "score": 50,
       "label": "Logs",
-      "value": "37 errors"
+      "value": "60 errors"
     },
     "kernel": {
       "score": 100,
@@ -58,19 +58,26 @@
     }
   },
   "rootCause": {
-    "summary": "No critical failures. High error count: 37. Correlation: No cascading failure patterns detected — subsystems are operating independently",
-    "confidence": 78
+    "summary": "Primary: Suspicious executables in /tmp or /dev/shm: 4 Pattern: No cascading failure patterns detected — subsystems are operating independently",
+    "confidence": 85
   },
   "correlations": [
     "No cascading failure patterns detected — subsystems are operating independently"
   ],
   "findings": {
-    "critical": [],
+    "critical": [
+      {
+        "severity": "critical",
+        "area": "Security",
+        "msg": "Suspicious executables in /tmp or /dev/shm: 4",
+        "evidence": "/var/log/auth.log, journalctl _SYSTEMD_UNIT=ssh"
+      }
+    ],
     "warnings": [
       {
         "severity": "warning",
         "area": "Logs",
-        "msg": "High error count: 37",
+        "msg": "High error count: 60",
         "evidence": "journalctl -p err, /var/log/syslog"
       },
       {
@@ -90,6 +97,11 @@
   },
   "recommendations": [
     {
+      "priority": "CRITICAL",
+      "action": "Investigate suspicious files",
+      "cmd": "ls -la /tmp /dev/shm && file /tmp/* /dev/shm/* 2>/dev/null"
+    },
+    {
       "priority": "HIGH",
       "action": "Disable SSH root login",
       "cmd": "sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && systemctl reload ssh"
@@ -103,11 +115,11 @@
   "raw": {
     "kernelErrors": [],
     "recentLogs": [
-      "May 31 09:45:36 ubuntu sudo[2688791]: pam_unix(sudo:auth): conversation failed",
-      "May 31 09:45:36 ubuntu sudo[2688791]: pam_unix(sudo:auth): auth could not identify password for [ubuntu]",
-      "May 31 11:49:33 ubuntu sudo[3161182]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/sshd -T",
-      "May 31 11:53:56 ubuntu sshd[3176077]: error: no more sessions",
-      "Jun 03 03:30:12 ubuntu sshd[3464130]: error: no more sessions"
+      "Jun 21 03:30:04 ubuntu sudo[620862]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
+      "Jun 21 03:30:04 ubuntu sudo[620863]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
+      "Jun 21 03:30:04 ubuntu sudo[620861]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
+      "Jun 21 03:30:21 ubuntu sshd[620608]: error: no more sessions",
+      "Jun 21 03:51:26 ubuntu systemd[1]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd."
     ],
     "failedServices": [],
     "openPorts": [
@@ -124,27 +136,13 @@
     ],
     "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  8.1G   38G  18% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
     "raidInfo": {
-      "topology": "lvm",
+      "topology": "bare",
       "arrays": [],
       "hwController": null,
-      "hasLvm": true,
+      "hasLvm": false,
       "pvs": [],
-      "vgs": [
-        [
-          "ubuntu-vg",
-          "?",
-          "1",
-          "?",
-          "?"
-        ]
-      ],
-      "lvs": [
-        [
-          "ubuntu--vg-ubuntu--lv",
-          "(lvm)",
-          "49G"
-        ]
-      ],
+      "vgs": [],
+      "lvs": [],
       "hasZfs": false,
       "zfsPoolNames": [],
       "personalities": [
@@ -162,14 +160,14 @@
         "installed": true,
         "version": "16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 6,
+        "connections": 7,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
         "totalSize": "34 MB",
         "cacheHitRatio": 100,
-        "maxConnections": 100,
-        "connPct": 6
+        "maxConnections": 0,
+        "connPct": 0
       }
     },
     "security": {
@@ -204,18 +202,6 @@
     },
     "topErrors": [
       {
-        "count": 5,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/u"
-      },
-      {
-        "count": 5,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/u"
-      },
-      {
-        "count": 5,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/u"
-      },
-      {
         "count": 1,
         "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
       },
@@ -231,7 +217,7 @@
     "crashSignals": {
       "segfaults": 0,
       "coreDumps": 0,
-      "timeouts": 28
+      "timeouts": 23
     },
     "kernelHardware": {
       "mce": [],
@@ -242,17 +228,17 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 323,
+      "tlsDays": 295,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 323
+          "days": 295
         }
       ],
       "ifErrors": [
-        "ens18 rx_err=0 rx_drop=1902061 tx_err=0"
+        "ens18 rx_err=0 rx_drop=3091034 tx_err=0"
       ]
     }
   }
