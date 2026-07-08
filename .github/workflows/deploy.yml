@@ -1,0 +1,27 @@
+name: Deploy Nova Platform
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+    - name: Execute deployment over SSH
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.SERVER_IP }}
+        username: ubuntu
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        script: |
+          cd /opt/nova
+          git pull origin main
+          # Install any new dependencies if package.json changed
+          cd backend && npm install
+          cd ../frontend && npm install
+          cd ../edge-agent && npm install
+          cd ..
+          pm2 restart ecosystem.config.js || pm2 start ecosystem.config.js
