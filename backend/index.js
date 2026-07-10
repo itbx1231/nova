@@ -4,9 +4,11 @@ const http = require('http');
 // Global error handlers to prevent silent crashes
 process.on('uncaughtException', (err) => {
   console.error('[FATAL] Uncaught Exception:', err);
+  process.exit(1);
 });
 process.on('unhandledRejection', (reason, promise) => {
   console.error('[FATAL] Unhandled Rejection at:', promise, 'reason:', reason);
+  process.exit(1);
 });
 
 // Polyfill for BigInt JSON serialization
@@ -72,21 +74,6 @@ const scanDb = (() => {
     if (initing) return initing;
     initing = (async () => {
       try {
-        await db.pool.query(`
-          CREATE TABLE IF NOT EXISTS scan_reports (
-            id         BIGSERIAL PRIMARY KEY,
-            file       TEXT UNIQUE,
-            host_id    TEXT,
-            ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
-            mode       TEXT,
-            score      INT,
-            health     TEXT,
-            critical   INT DEFAULT 0,
-            warnings   INT DEFAULT 0,
-            subsystems JSONB,
-            raw        JSONB
-          )`);
-        await db.pool.query(`CREATE INDEX IF NOT EXISTS idx_scan_reports_host_ts ON scan_reports(host_id, ts DESC)`);
         ready = true;
         await backfill();   // one-time import of existing JSON files
         return true;
@@ -185,45 +172,7 @@ const scanDb = (() => {
 // warm the table at startup (non-blocking)
 setImmediate(() => scanDb.ensure().catch(() => {}));
 
-// ─── JWT Secret (auto-generate if missing) ──────────────────────────────────
-const JWT_SECRET = (() => {
-  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
-  // Auto-generate and persist to .env
-  const generated = crypto.randomBytes(48).toString('hex');
-  try {
-    const envPath = path.join(__dirname, '.env');
-    fs.appendFileSync(envPath, `JWT_SECRET=${generated}\n`);
-    console.log('[SECURITY] Auto-generated JWT_SECRET and saved to .env');
-  } catch (e) {
-    console.warn('[SECURITY] Could not persist JWT_SECRET to .env — using ephemeral key');
-  }
-  return generated;
-})();
-
-// ─── Auth Middleware (defined early so all routes can use it) ────────────────
-const authMiddleware = (req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch { res.status(401).json({ error: 'Token invalid or expired' }); }
-};
-
-const verifyAdmin = (req, res, next) => {
-  if (req.user && req.user.role === 'admin') next();
-  else res.status(403).json({ error: 'Forbidden: Requires Administrator Privileges' });
-};
-
-// ─── Agent Token for /api/report ────────────────────────────────────────────
-const AGENT_SECRET = process.env.AGENT_SECRET || crypto.randomBytes(32).toString('hex');
-if (!process.env.AGENT_SECRET) {
-  try {
-    const envPath = path.join(__dirname, '.env');
-    fs.appendFileSync(envPath, `\nAGENT_SECRET=${AGENT_SECRET}\n`);
-    console.log(`[SECURITY] Auto-generated AGENT_SECRET and saved to .env`);
-  } catch(e) { console.warn('[SECURITY] Could not persist AGENT_SECRET'); }
-}
+const { authMiddleware, verifyAdmin, JWT_SECRET, AGENT_SECRET } = require('./middleware/auth');
 
 // ─── SSRF Protection Helper ─────────────────────────────────────────────────
 const { URL } = require('url');
@@ -3014,6 +2963,43 @@ app.post('/api/services/:id/ping', async (req, res) => {
     res.json({ status: ok ? 'online' : 'offline', latency });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+app.get('/api/netbird/status', authMiddleware, async (req, res) => {
+  try {
+    const { exec } = require('child_process');
+    exec('netbird status', (error, stdout, stderr) => {
+      if (error) {
+        return res.json({ status: 'error', message: 'NetBird not running or installed', details: error.message });
+      }
+      
+      // Parse basic output
+      const lines = stdout.split('\n');
+      const isConnected = stdout.includes('Connected');
+      
+      // Extract peers if any
+      const peers = [];
+      let parsingPeers = false;
+      lines.forEach(line => {
+        if (line.includes('Peers:')) { parsingPeers = true; return; }
+        if (parsingPeers && line.trim() && line.startsWith(' ')) {
+          const parts = line.trim().split(/\s+/);
+          if(parts.length >= 2) peers.push({ id: parts[0], status: parts.slice(1).join(' ') });
+        } else if (line.trim() === '') {
+          parsingPeers = false;
+        }
+      });
+
+      res.json({ status: isConnected ? 'online' : 'offline', raw: stdout, peers });
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = app;
+
+// Start alerting service
+require('./services/alertService');
 
 // ─── Local System Stats (for docker/node-exporter type) ──────────────────────
 async function getLocalSystemStats(svc) {

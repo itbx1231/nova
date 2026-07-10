@@ -1,15 +1,15 @@
 {
-  "ts": 1783481412401,
-  "jobId": "mrbis0y6m8xw",
+  "ts": 1783567813459,
+  "jobId": "mrcy7w2njkl2",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
-  "overallScore": 88,
+  "overallScore": 90,
   "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 88,
+      "score": 98,
       "label": "CPU",
-      "value": "1 load"
+      "value": "0.14 load"
     },
     "memory": {
       "score": 92,
@@ -115,11 +115,11 @@
   "raw": {
     "kernelErrors": [],
     "recentLogs": [
-      "Jun 25 03:30:03 ubuntu sudo[3711573]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
-      "Jun 25 03:30:03 ubuntu sudo[3711574]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
-      "Jun 25 03:30:03 ubuntu sudo[3711575]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
       "Jun 25 03:30:12 ubuntu sshd[3711355]: error: no more sessions",
-      "Jun 26 03:30:03 ubuntu sudo[4092047]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count"
+      "Jun 26 03:30:03 ubuntu sudo[4092047]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
+      "Jun 26 03:30:03 ubuntu sudo[4092049]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
+      "Jun 26 03:30:03 ubuntu sudo[4092048]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
+      "Jun 27 03:30:04 ubuntu sudo[282482]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free"
     ],
     "failedServices": [],
     "openPorts": [
@@ -134,7 +134,7 @@
       "[::]:22",
       "*:3001"
     ],
-    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  8.1G   38G  18% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
+    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  8.2G   38G  18% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
     "raidInfo": {
       "topology": "bare",
       "arrays": [],
@@ -160,14 +160,14 @@
         "installed": true,
         "version": "16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 8,
+        "connections": 7,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
         "totalSize": "34 MB",
         "cacheHitRatio": 100,
-        "maxConnections": 100,
-        "connPct": 8
+        "maxConnections": 0,
+        "connPct": 0
       }
     },
     "security": {
@@ -202,26 +202,22 @@
     },
     "topErrors": [
       {
-        "count": 2,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
-      },
-      {
-        "count": 2,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
-      },
-      {
-        "count": 2,
+        "count": 1,
         "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
       },
       {
         "count": 1,
-        "pattern": "sshd[]: error: no more sessions"
+        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
+      },
+      {
+        "count": 1,
+        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
       }
     ],
     "crashSignals": {
       "segfaults": 0,
       "coreDumps": 0,
-      "timeouts": 24
+      "timeouts": 28
     },
     "kernelHardware": {
       "mce": [],
@@ -232,17 +228,17 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 291,
+      "tlsDays": 290,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 291
+          "days": 290
         }
       ],
       "ifErrors": [
-        "ens18 rx_err=0 rx_drop=3263564 tx_err=0"
+        "ens18 rx_err=0 rx_drop=3306696 tx_err=0"
       ]
     }
   }

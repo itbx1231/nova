@@ -98,9 +98,25 @@ const initDB = async () => {
       severity TEXT DEFAULT 'warning',
       message TEXT,
       channel TEXT,
-      sent INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'sent',
       timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS scan_reports (
+        id         BIGSERIAL PRIMARY KEY,
+        file       TEXT UNIQUE,
+        host_id    TEXT,
+        ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
+        mode       TEXT,
+        score      INT,
+        health     TEXT,
+        critical   INT DEFAULT 0,
+        warnings   INT DEFAULT 0,
+        subsystems JSONB,
+        raw        JSONB
+      )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_scan_reports_host_ts ON scan_reports(host_id, ts DESC)`);
 
     await pool.query(`CREATE TABLE IF NOT EXISTS disk_analytics (
       id SERIAL PRIMARY KEY,

@@ -16,6 +16,19 @@ const JWT_SECRET = (() => {
   return generated;
 })();
 
+const AGENT_SECRET = (() => {
+  if (process.env.AGENT_SECRET) return process.env.AGENT_SECRET;
+  const generated = crypto.randomBytes(32).toString('hex');
+  try {
+    const envPath = path.join(__dirname, '..', '.env');
+    fs.appendFileSync(envPath, `\nAGENT_SECRET=${generated}\n`);
+    console.log('✅ Generated new AGENT_SECRET and saved to .env');
+  } catch (err) {
+    console.error('⚠️ Could not save AGENT_SECRET to .env.');
+  }
+  return generated;
+})();
+
 const authMiddleware = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
@@ -32,4 +45,4 @@ const verifyAdmin = (req, res, next) => {
   else res.status(403).json({ error: 'Forbidden: Requires Administrator Privileges' });
 };
 
-module.exports = { authMiddleware, verifyAdmin, JWT_SECRET };
+module.exports = { authMiddleware, verifyAdmin, JWT_SECRET, AGENT_SECRET };
