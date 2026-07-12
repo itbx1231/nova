@@ -1,15 +1,15 @@
 {
-  "ts": 1783654212757,
-  "jobId": "mrednqen62we",
+  "ts": 1783740613280,
+  "jobId": "mrft3le8gp3f",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
   "overallScore": 89,
   "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 99,
+      "score": 98,
       "label": "CPU",
-      "value": "0.07 load"
+      "value": "0.18 load"
     },
     "memory": {
       "score": 90,
@@ -115,11 +115,11 @@
   "raw": {
     "kernelErrors": [],
     "recentLogs": [
-      "Jun 27 03:30:04 ubuntu sudo[282481]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
-      "Jun 27 03:30:12 ubuntu sshd[282335]: error: no more sessions",
-      "Jun 27 16:23:46 ubuntu systemd[1]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd.",
-      "Jun 27 17:27:33 ubuntu systemd[1]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd.",
-      "Jun 27 18:02:33 ubuntu systemd[1]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd."
+      "Jun 27 18:02:33 ubuntu systemd[1]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd.",
+      "Jun 27 19:24:16 ubuntu systemd[1]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd.",
+      "Jun 27 20:44:56 ubuntu systemd[1]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd.",
+      "Jun 27 21:40:05 ubuntu systemd[1]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd.",
+      "Jun 28 03:30:04 ubuntu sudo[664518]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin"
     ],
     "failedServices": [],
     "openPorts": [
@@ -160,14 +160,14 @@
         "installed": true,
         "version": "16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 6,
+        "connections": 8,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
         "totalSize": "34 MB",
         "cacheHitRatio": 100,
-        "maxConnections": 0,
-        "connPct": 0
+        "maxConnections": 100,
+        "connPct": 8
       }
     },
     "security": {
@@ -215,14 +215,6 @@
       },
       {
         "count": 1,
-        "pattern": "sudo[]: pam_unix(sudo:auth): conversation failed"
-      },
-      {
-        "count": 1,
-        "pattern": "sudo[]: pam_unix(sudo:auth): auth could not identify password for [ubuntu]"
-      },
-      {
-        "count": 1,
         "pattern": "sshd[]: error: no more sessions"
       }
     ],
@@ -240,17 +232,17 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 289,
+      "tlsDays": 288,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 289
+          "days": 288
         }
       ],
       "ifErrors": [
-        "ens18 rx_err=0 rx_drop=3349829 tx_err=0"
+        "ens18 rx_err=0 rx_drop=3392962 tx_err=0"
       ]
     }
   }
