@@ -6,6 +6,10 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgres://nova:nova_password@127.0.0.1:5432/nova_telemetry'
 });
 
+pool.on("error", (err, client) => {
+  console.error("[PostgreSQL] Unexpected error on idle client", err.message);
+});
+
 // Initialize Tables
 const initDB = async () => {
   try {
