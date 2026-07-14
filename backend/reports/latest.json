@@ -1,15 +1,15 @@
 {
-  "ts": 1783827013806,
-  "jobId": "mrh8jfl196cm",
+  "ts": 1783913414079,
+  "jobId": "mrinzaode5lx",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
-  "overallScore": 89,
+  "overallScore": 87,
   "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 93,
+      "score": 96,
       "label": "CPU",
-      "value": "0.57 load"
+      "value": "0.32 load"
     },
     "memory": {
       "score": 90,
@@ -27,9 +27,9 @@
       "value": "0% loss · DNS ok"
     },
     "services": {
-      "score": 100,
+      "score": 85,
       "label": "Services",
-      "value": "0 failed"
+      "value": "1 failed"
     },
     "security": {
       "score": 76,
@@ -49,7 +49,7 @@
     "docker": {
       "score": 100,
       "label": "Docker",
-      "value": "not installed"
+      "value": "0 running · 0 unhealthy"
     },
     "database": {
       "score": 100,
@@ -58,18 +58,24 @@
     }
   },
   "rootCause": {
-    "summary": "Primary: Suspicious executables in /tmp or /dev/shm: 4 Pattern: Zombie process accumulation (7) indicates parent process not reaping children — possible application crash loop",
+    "summary": "Primary: 1 systemd services failed. Plus 1 more critical. Pattern: No cascading failure patterns detected — subsystems are operating independently",
     "confidence": 85
   },
   "correlations": [
-    "Zombie process accumulation (7) indicates parent process not reaping children — possible application crash loop"
+    "No cascading failure patterns detected — subsystems are operating independently"
   ],
   "findings": {
     "critical": [
       {
         "severity": "critical",
+        "area": "Services",
+        "msg": "1 systemd services failed",
+        "evidence": "systemctl list-units, pm2 list"
+      },
+      {
+        "severity": "critical",
         "area": "Security",
-        "msg": "Suspicious executables in /tmp or /dev/shm: 4",
+        "msg": "Suspicious executables in /tmp or /dev/shm: 5",
         "evidence": "/var/log/auth.log, journalctl _SYSTEMD_UNIT=ssh"
       }
     ],
@@ -98,6 +104,11 @@
   "recommendations": [
     {
       "priority": "CRITICAL",
+      "action": "Restart failed services",
+      "cmd": "systemctl reset-failed"
+    },
+    {
+      "priority": "CRITICAL",
       "action": "Investigate suspicious files",
       "cmd": "ls -la /tmp /dev/shm && file /tmp/* /dev/shm/* 2>/dev/null"
     },
@@ -115,13 +126,15 @@
   "raw": {
     "kernelErrors": [],
     "recentLogs": [
-      "Jun 30 03:30:04 ubuntu sudo[1423905]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
-      "Jun 30 03:30:12 ubuntu sshd[1423722]: error: no more sessions",
-      "Jul 01 03:30:04 ubuntu sudo[1803735]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
-      "Jul 01 03:30:04 ubuntu sudo[1803734]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
-      "Jul 01 03:30:04 ubuntu sudo[1803733]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count"
+      "Jul 07 03:30:04 ubuntu sudo[4081198]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
+      "Jul 07 03:30:04 ubuntu sudo[4081197]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
+      "Jul 07 03:30:12 ubuntu sshd[4080966]: error: no more sessions",
+      "Jul 08 03:30:03 ubuntu sudo[266195]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
+      "Jul 08 03:30:03 ubuntu sudo[266197]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free"
     ],
-    "failedServices": [],
+    "failedServices": [
+      "● pm2-ubuntu.service loaded failed failed PM2 process manager"
+    ],
     "openPorts": [
       "0.0.0.0:22",
       "0.0.0.0:3000",
@@ -134,7 +147,7 @@
       "127.0.0.54:53",
       "[::]:22"
     ],
-    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  8.4G   38G  19% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
+    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.2M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  9.0G   37G  20% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
     "raidInfo": {
       "topology": "lvm",
       "arrays": [],
@@ -224,34 +237,26 @@
     },
     "topErrors": [
       {
-        "count": 7,
+        "count": 9,
         "pattern": "sudo[]: pam_unix(sudo:auth): conversation failed"
       },
       {
-        "count": 7,
+        "count": 9,
         "pattern": "sudo[]: pam_unix(sudo:auth): auth could not identify password for [ubuntu]"
       },
       {
-        "count": 1,
-        "pattern": "su[]: pam_unix(su-l:auth): auth could not identify password for [postgres]"
+        "count": 6,
+        "pattern": "systemd[]: Failed to start pm-ubuntu.service - PM process manager."
       },
       {
-        "count": 1,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
-      },
-      {
-        "count": 1,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
-      },
-      {
-        "count": 1,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
+        "count": 2,
+        "pattern": "systemd[]: pm-ubuntu.service: New main PID  does not belong to service, and PID file is no"
       }
     ],
     "crashSignals": {
       "segfaults": 0,
       "coreDumps": 0,
-      "timeouts": 25
+      "timeouts": 26
     },
     "kernelHardware": {
       "mce": [],
@@ -262,17 +267,17 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 287,
+      "tlsDays": 286,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 287
+          "days": 286
         }
       ],
       "ifErrors": [
-        "ens18 rx_err=0 rx_drop=3436094 tx_err=0"
+        "ens18 rx_err=0 rx_drop=3452074 tx_err=0"
       ]
     }
   }
