@@ -1,20 +1,20 @@
 {
-  "ts": 1781407823139,
-  "jobId": "mqd87l2mcurs",
+  "ts": 1783999812775,
+  "jobId": "mrk3f4xbgkr6",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
-  "overallScore": 77,
-  "health": "DEGRADED",
+  "overallScore": 88,
+  "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 96,
+      "score": 99,
       "label": "CPU",
-      "value": "0.3 load"
+      "value": "0.05 load"
     },
     "memory": {
-      "score": 92,
+      "score": 90,
       "label": "Memory",
-      "value": "8% used"
+      "value": "10% used"
     },
     "disk": {
       "score": 100,
@@ -22,14 +22,14 @@
       "value": "0 critical"
     },
     "network": {
-      "score": 0,
+      "score": 100,
       "label": "Network",
-      "value": "100% loss · DNS DOWN"
+      "value": "0% loss · DNS ok"
     },
     "services": {
-      "score": 100,
+      "score": 85,
       "label": "Services",
-      "value": "0 failed"
+      "value": "1 failed"
     },
     "security": {
       "score": 76,
@@ -49,7 +49,7 @@
     "docker": {
       "score": 100,
       "label": "Docker",
-      "value": "not installed"
+      "value": "0 running · 0 unhealthy"
     },
     "database": {
       "score": 100,
@@ -58,7 +58,7 @@
     }
   },
   "rootCause": {
-    "summary": "Primary: High packet loss: 100%. Plus 1 more critical. Pattern: No cascading failure patterns detected — subsystems are operating independently",
+    "summary": "Primary: 1 systemd services failed. Plus 1 more critical. Pattern: No cascading failure patterns detected — subsystems are operating independently",
     "confidence": 85
   },
   "correlations": [
@@ -68,15 +68,15 @@
     "critical": [
       {
         "severity": "critical",
-        "area": "Network",
-        "msg": "High packet loss: 100%",
-        "evidence": "ping, ss -tlnp"
+        "area": "Services",
+        "msg": "1 systemd services failed",
+        "evidence": "systemctl list-units, pm2 list"
       },
       {
         "severity": "critical",
-        "area": "Network",
-        "msg": "DNS resolution failing",
-        "evidence": "getent hosts google.com"
+        "area": "Security",
+        "msg": "Suspicious executables in /tmp or /dev/shm: 5",
+        "evidence": "/var/log/auth.log, journalctl _SYSTEMD_UNIT=ssh"
       }
     ],
     "warnings": [
@@ -103,6 +103,16 @@
   },
   "recommendations": [
     {
+      "priority": "CRITICAL",
+      "action": "Restart failed services",
+      "cmd": "systemctl reset-failed"
+    },
+    {
+      "priority": "CRITICAL",
+      "action": "Investigate suspicious files",
+      "cmd": "ls -la /tmp /dev/shm && file /tmp/* /dev/shm/* 2>/dev/null"
+    },
+    {
       "priority": "HIGH",
       "action": "Disable SSH root login",
       "cmd": "sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && systemctl reload ssh"
@@ -111,25 +121,23 @@
       "priority": "MEDIUM",
       "action": "Enforce key-based SSH auth",
       "cmd": "sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl reload ssh"
-    },
-    {
-      "priority": "CRITICAL",
-      "action": "Fix DNS resolution",
-      "cmd": "systemctl restart systemd-resolved; cat /etc/resolv.conf"
     }
   ],
   "raw": {
     "kernelErrors": [],
     "recentLogs": [
-      "Jun 06 03:30:04 ubuntu sudo[1954442]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
-      "Jun 06 03:30:16 ubuntu sshd[1954297]: error: no more sessions",
-      "Jun 06 11:40:38 ubuntu sudo[3650241]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
-      "Jun 06 11:40:38 ubuntu sudo[3650244]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
-      "Jun 06 11:40:38 ubuntu sudo[3650247]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin"
+      "Jul 07 03:30:04 ubuntu sudo[4081198]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
+      "Jul 07 03:30:04 ubuntu sudo[4081197]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
+      "Jul 07 03:30:12 ubuntu sshd[4080966]: error: no more sessions",
+      "Jul 08 03:30:03 ubuntu sudo[266195]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
+      "Jul 08 03:30:03 ubuntu sudo[266197]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free"
     ],
-    "failedServices": [],
+    "failedServices": [
+      "● pm2-ubuntu.service loaded failed failed PM2 process manager"
+    ],
     "openPorts": [
       "0.0.0.0:22",
+      "0.0.0.0:3000",
       "0.0.0.0:443",
       "0.0.0.0:5010",
       "0.0.0.0:80",
@@ -137,30 +145,37 @@
       "127.0.0.1:5432",
       "127.0.0.53%lo:53",
       "127.0.0.54:53",
-      "[::]:22",
-      "*:3001"
+      "[::]:22"
     ],
-    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  8.2G   38G  18% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
+    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.2M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  9.0G   37G  20% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
     "raidInfo": {
       "topology": "lvm",
       "arrays": [],
       "hwController": null,
       "hasLvm": true,
-      "pvs": [],
+      "pvs": [
+        [
+          "/dev/sda3",
+          "<98.00g",
+          "ubuntu-vg",
+          "25087"
+        ]
+      ],
       "vgs": [
         [
           "ubuntu-vg",
-          "?",
           "1",
-          "?",
-          "?"
+          "1",
+          "<98.00g",
+          "49.00g"
         ]
       ],
       "lvs": [
         [
-          "ubuntu--vg-ubuntu--lv",
-          "(lvm)",
-          "49G"
+          "ubuntu-lv",
+          "ubuntu-vg",
+          "<49.00g",
+          "-wi-ao----"
         ]
       ],
       "hasZfs": false,
@@ -180,14 +195,14 @@
         "installed": true,
         "version": "16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 6,
+        "connections": 7,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
         "totalSize": "34 MB",
         "cacheHitRatio": 100,
         "maxConnections": 100,
-        "connPct": 6
+        "connPct": 7
       }
     },
     "security": {
@@ -222,22 +237,14 @@
     },
     "topErrors": [
       {
-        "count": 2,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
-      },
-      {
-        "count": 2,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
-      },
-      {
-        "count": 2,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
+        "count": 1,
+        "pattern": "-- No entries --"
       }
     ],
     "crashSignals": {
       "segfaults": 0,
       "coreDumps": 0,
-      "timeouts": 36
+      "timeouts": 25
     },
     "kernelHardware": {
       "mce": [],
@@ -245,20 +252,20 @@
     },
     "fsErrors": [],
     "network": {
-      "dnsOk": false,
+      "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 315,
+      "tlsDays": 285,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 315
+          "days": 285
         }
       ],
       "ifErrors": [
-        "ens18 rx_err=0 rx_drop=2228385 tx_err=0"
+        "ens18 rx_err=0 rx_drop=3452074 tx_err=0"
       ]
     }
   }

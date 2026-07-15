@@ -1,15 +1,15 @@
 {
-  "ts": 1783913414079,
-  "jobId": "mrinzaode5lx",
+  "ts": 1783999812775,
+  "jobId": "mrk3f4xbgkr6",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
-  "overallScore": 87,
+  "overallScore": 88,
   "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 96,
+      "score": 99,
       "label": "CPU",
-      "value": "0.32 load"
+      "value": "0.05 load"
     },
     "memory": {
       "score": 90,
@@ -195,14 +195,14 @@
         "installed": true,
         "version": "16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 6,
+        "connections": 7,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
         "totalSize": "34 MB",
         "cacheHitRatio": 100,
         "maxConnections": 100,
-        "connPct": 6
+        "connPct": 7
       }
     },
     "security": {
@@ -237,26 +237,14 @@
     },
     "topErrors": [
       {
-        "count": 9,
-        "pattern": "sudo[]: pam_unix(sudo:auth): conversation failed"
-      },
-      {
-        "count": 9,
-        "pattern": "sudo[]: pam_unix(sudo:auth): auth could not identify password for [ubuntu]"
-      },
-      {
-        "count": 6,
-        "pattern": "systemd[]: Failed to start pm-ubuntu.service - PM process manager."
-      },
-      {
-        "count": 2,
-        "pattern": "systemd[]: pm-ubuntu.service: New main PID  does not belong to service, and PID file is no"
+        "count": 1,
+        "pattern": "-- No entries --"
       }
     ],
     "crashSignals": {
       "segfaults": 0,
       "coreDumps": 0,
-      "timeouts": 26
+      "timeouts": 25
     },
     "kernelHardware": {
       "mce": [],
@@ -267,13 +255,13 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 286,
+      "tlsDays": 285,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 286
+          "days": 285
         }
       ],
       "ifErrors": [
