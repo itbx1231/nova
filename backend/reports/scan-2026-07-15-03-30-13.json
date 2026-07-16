@@ -1,20 +1,20 @@
 {
-  "ts": 1781494220202,
-  "jobId": "mqennga2lnx8",
+  "ts": 1784086213508,
+  "jobId": "mrliuzurr7ul",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
-  "overallScore": 75,
-  "health": "DEGRADED",
+  "overallScore": 87,
+  "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 99,
+      "score": 95,
       "label": "CPU",
-      "value": "0.07 load"
+      "value": "0.44 load"
     },
     "memory": {
-      "score": 91,
+      "score": 90,
       "label": "Memory",
-      "value": "9% used"
+      "value": "10% used"
     },
     "disk": {
       "score": 100,
@@ -22,9 +22,9 @@
       "value": "0 critical"
     },
     "network": {
-      "score": 0,
+      "score": 100,
       "label": "Network",
-      "value": "100% loss · DNS DOWN"
+      "value": "0% loss · DNS ok"
     },
     "services": {
       "score": 85,
@@ -39,7 +39,7 @@
     "logs": {
       "score": 50,
       "label": "Logs",
-      "value": "60 errors"
+      "value": "61 errors"
     },
     "kernel": {
       "score": 100,
@@ -49,7 +49,7 @@
     "docker": {
       "score": 100,
       "label": "Docker",
-      "value": "not installed"
+      "value": "0 running · 0 unhealthy"
     },
     "database": {
       "score": 100,
@@ -58,12 +58,11 @@
     }
   },
   "rootCause": {
-    "summary": "Primary: 1 systemd services failed. Plus 2 more critical. Pattern: Network offline causing cascading service failures — 1 unit(s) failed",
+    "summary": "Primary: 1 systemd services failed. Plus 1 more critical. Pattern: No cascading failure patterns detected — subsystems are operating independently",
     "confidence": 85
   },
   "correlations": [
-    "Network offline causing cascading service failures — 1 unit(s) failed",
-    "DNS resolution failing alongside 1 service failure(s) — name-resolution outage likely cascading to dependent services"
+    "No cascading failure patterns detected — subsystems are operating independently"
   ],
   "findings": {
     "critical": [
@@ -75,22 +74,16 @@
       },
       {
         "severity": "critical",
-        "area": "Network",
-        "msg": "High packet loss: 100%",
-        "evidence": "ping, ss -tlnp"
-      },
-      {
-        "severity": "critical",
-        "area": "Network",
-        "msg": "DNS resolution failing",
-        "evidence": "getent hosts google.com"
+        "area": "Security",
+        "msg": "Suspicious executables in /tmp or /dev/shm: 5",
+        "evidence": "/var/log/auth.log, journalctl _SYSTEMD_UNIT=ssh"
       }
     ],
     "warnings": [
       {
         "severity": "warning",
         "area": "Logs",
-        "msg": "High error count: 60",
+        "msg": "High error count: 61",
         "evidence": "journalctl -p err, /var/log/syslog"
       },
       {
@@ -115,6 +108,11 @@
       "cmd": "systemctl reset-failed"
     },
     {
+      "priority": "CRITICAL",
+      "action": "Investigate suspicious files",
+      "cmd": "ls -la /tmp /dev/shm && file /tmp/* /dev/shm/* 2>/dev/null"
+    },
+    {
       "priority": "HIGH",
       "action": "Disable SSH root login",
       "cmd": "sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && systemctl reload ssh"
@@ -123,27 +121,23 @@
       "priority": "MEDIUM",
       "action": "Enforce key-based SSH auth",
       "cmd": "sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl reload ssh"
-    },
-    {
-      "priority": "CRITICAL",
-      "action": "Fix DNS resolution",
-      "cmd": "systemctl restart systemd-resolved; cat /etc/resolv.conf"
     }
   ],
   "raw": {
     "kernelErrors": [],
     "recentLogs": [
-      "Jun 06 11:41:16 ubuntu sudo[3652243]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
-      "Jun 06 11:41:16 ubuntu sudo[3652246]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
-      "Jun 06 11:41:16 ubuntu sudo[3652249]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
-      "Jun 06 12:05:28 ubuntu sudo[3731692]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
-      "Jun 06 12:05:28 ubuntu sudo[3731695]:   ubuntu : a password is required ; PWD=/opt/nova/backend ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free"
+      "Jul 08 03:30:03 ubuntu sudo[266197]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
+      "Jul 08 03:30:03 ubuntu sudo[266196]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
+      "Jul 09 03:30:04 ubuntu sudo[645031]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
+      "Jul 09 03:30:04 ubuntu sudo[645030]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
+      "Jul 09 03:30:04 ubuntu sudo[645032]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin"
     ],
     "failedServices": [
-      "● fwupd-refresh.service loaded failed failed Refresh fwupd metadata and update motd"
+      "● pm2-ubuntu.service loaded failed failed PM2 process manager"
     ],
     "openPorts": [
       "0.0.0.0:22",
+      "0.0.0.0:3000",
       "0.0.0.0:443",
       "0.0.0.0:5010",
       "0.0.0.0:80",
@@ -151,30 +145,37 @@
       "127.0.0.1:5432",
       "127.0.0.53%lo:53",
       "127.0.0.54:53",
-      "[::]:22",
-      "*:3001"
+      "[::]:22"
     ],
-    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  8.1G   38G  18% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
+    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.2M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  9.0G   37G  20% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
     "raidInfo": {
       "topology": "lvm",
       "arrays": [],
       "hwController": null,
       "hasLvm": true,
-      "pvs": [],
+      "pvs": [
+        [
+          "/dev/sda3",
+          "<98.00g",
+          "ubuntu-vg",
+          "25087"
+        ]
+      ],
       "vgs": [
         [
           "ubuntu-vg",
-          "?",
           "1",
-          "?",
-          "?"
+          "1",
+          "<98.00g",
+          "49.00g"
         ]
       ],
       "lvs": [
         [
-          "ubuntu--vg-ubuntu--lv",
-          "(lvm)",
-          "49G"
+          "ubuntu-lv",
+          "ubuntu-vg",
+          "<49.00g",
+          "-wi-ao----"
         ]
       ],
       "hasZfs": false,
@@ -194,14 +195,14 @@
         "installed": true,
         "version": "16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 12,
+        "connections": 7,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
         "totalSize": "34 MB",
         "cacheHitRatio": 100,
         "maxConnections": 100,
-        "connPct": 12
+        "connPct": 7
       }
     },
     "security": {
@@ -237,23 +238,23 @@
     "topErrors": [
       {
         "count": 1,
-        "pattern": "systemd[]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd."
+        "pattern": "Read()     c c    res /:::c:/::::/a Emask x (timeout)"
       },
       {
         "count": 1,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
+        "pattern": "kernel: I/O error, dev sr, sector  op x:(READ) flags x phys_seg  prio class"
       },
       {
         "count": 1,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
+        "pattern": "kernel: ata.: status: { DRDY }"
       },
       {
         "count": 1,
-        "pattern": "sudo[]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sb"
+        "pattern": "kernel: ata.: exception Emask x SAct x SErr x action x frozen"
       },
       {
         "count": 1,
-        "pattern": "sshd[]: error: no more sessions"
+        "pattern": "kernel: ata.: cmd a/::::/::::/a tag  dma  in"
       }
     ],
     "crashSignals": {
@@ -267,20 +268,20 @@
     },
     "fsErrors": [],
     "network": {
-      "dnsOk": false,
+      "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 314,
+      "tlsDays": 284,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 314
+          "days": 284
         }
       ],
       "ifErrors": [
-        "ens18 rx_err=0 rx_drop=2271518 tx_err=0"
+        "ens18 rx_err=0 rx_drop=3452094 tx_err=0"
       ]
     }
   }

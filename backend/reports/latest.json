@@ -1,15 +1,15 @@
 {
-  "ts": 1783999812775,
-  "jobId": "mrk3f4xbgkr6",
+  "ts": 1784086213508,
+  "jobId": "mrliuzurr7ul",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
-  "overallScore": 88,
+  "overallScore": 87,
   "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 99,
+      "score": 95,
       "label": "CPU",
-      "value": "0.05 load"
+      "value": "0.44 load"
     },
     "memory": {
       "score": 90,
@@ -39,7 +39,7 @@
     "logs": {
       "score": 50,
       "label": "Logs",
-      "value": "60 errors"
+      "value": "61 errors"
     },
     "kernel": {
       "score": 100,
@@ -83,7 +83,7 @@
       {
         "severity": "warning",
         "area": "Logs",
-        "msg": "High error count: 60",
+        "msg": "High error count: 61",
         "evidence": "journalctl -p err, /var/log/syslog"
       },
       {
@@ -126,11 +126,11 @@
   "raw": {
     "kernelErrors": [],
     "recentLogs": [
-      "Jul 07 03:30:04 ubuntu sudo[4081198]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
-      "Jul 07 03:30:04 ubuntu sudo[4081197]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
-      "Jul 07 03:30:12 ubuntu sshd[4080966]: error: no more sessions",
-      "Jul 08 03:30:03 ubuntu sudo[266195]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
-      "Jul 08 03:30:03 ubuntu sudo[266197]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free"
+      "Jul 08 03:30:03 ubuntu sudo[266197]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
+      "Jul 08 03:30:03 ubuntu sudo[266196]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
+      "Jul 09 03:30:04 ubuntu sudo[645031]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
+      "Jul 09 03:30:04 ubuntu sudo[645030]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
+      "Jul 09 03:30:04 ubuntu sudo[645032]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin"
     ],
     "failedServices": [
       "● pm2-ubuntu.service loaded failed failed PM2 process manager"
@@ -238,13 +238,29 @@
     "topErrors": [
       {
         "count": 1,
-        "pattern": "-- No entries --"
+        "pattern": "Read()     c c    res /:::c:/::::/a Emask x (timeout)"
+      },
+      {
+        "count": 1,
+        "pattern": "kernel: I/O error, dev sr, sector  op x:(READ) flags x phys_seg  prio class"
+      },
+      {
+        "count": 1,
+        "pattern": "kernel: ata.: status: { DRDY }"
+      },
+      {
+        "count": 1,
+        "pattern": "kernel: ata.: exception Emask x SAct x SErr x action x frozen"
+      },
+      {
+        "count": 1,
+        "pattern": "kernel: ata.: cmd a/::::/::::/a tag  dma  in"
       }
     ],
     "crashSignals": {
       "segfaults": 0,
       "coreDumps": 0,
-      "timeouts": 25
+      "timeouts": 27
     },
     "kernelHardware": {
       "mce": [],
@@ -255,17 +271,17 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 285,
+      "tlsDays": 284,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 285
+          "days": 284
         }
       ],
       "ifErrors": [
-        "ens18 rx_err=0 rx_drop=3452074 tx_err=0"
+        "ens18 rx_err=0 rx_drop=3452094 tx_err=0"
       ]
     }
   }
