@@ -1,6 +1,6 @@
 {
-  "ts": 1784950213989,
-  "jobId": "mrzt9j0ubhl9",
+  "ts": 1785036613609,
+  "jobId": "ms18pdiubp8y",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
   "overallScore": 90,
@@ -9,7 +9,7 @@
     "cpu": {
       "score": 99,
       "label": "CPU",
-      "value": "0.07 load"
+      "value": "0.08 load"
     },
     "memory": {
       "score": 91,
@@ -230,13 +230,13 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 274,
+      "tlsDays": 273,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 274
+          "days": 273
         }
       ],
       "ifErrors": [
