@@ -1,20 +1,20 @@
 {
-  "ts": 1785814213869,
-  "jobId": "mse3o1f6l1z8",
+  "ts": 1785900613248,
+  "jobId": "msfj3vlfz2vb",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
   "overallScore": 89,
   "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 91,
+      "score": 98,
       "label": "CPU",
-      "value": "0.73 load"
+      "value": "0.17 load"
     },
     "memory": {
-      "score": 91,
+      "score": 90,
       "label": "Memory",
-      "value": "9% used"
+      "value": "10% used"
     },
     "disk": {
       "score": 100,
@@ -219,7 +219,7 @@
     "crashSignals": {
       "segfaults": 0,
       "coreDumps": 0,
-      "timeouts": 25
+      "timeouts": 24
     },
     "kernelHardware": {
       "mce": [],
@@ -230,13 +230,13 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 264,
+      "tlsDays": 263,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 264
+          "days": 263
         }
       ],
       "ifErrors": [
