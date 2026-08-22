@@ -1,15 +1,15 @@
 {
-  "ts": 1787196614977,
-  "jobId": "mt0ypo6fmxku",
+  "ts": 1787283014049,
+  "jobId": "mt2e5inpc917",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
-  "overallScore": 89,
+  "overallScore": 90,
   "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 98,
+      "score": 99,
       "label": "CPU",
-      "value": "0.18 load"
+      "value": "0.07 load"
     },
     "memory": {
       "score": 91,
@@ -122,7 +122,7 @@
       "127.0.0.54:53",
       "[::]:22"
     ],
-    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  9.2G   37G  21% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
+    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  9.1G   37G  20% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
     "raidInfo": {
       "topology": "lvm",
       "arrays": [],
@@ -170,14 +170,14 @@
         "installed": true,
         "version": "16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 7,
+        "connections": 13,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
         "totalSize": "35 MB",
         "cacheHitRatio": 100,
         "maxConnections": 100,
-        "connPct": 7
+        "connPct": 13
       }
     },
     "security": {
@@ -219,7 +219,7 @@
     "crashSignals": {
       "segfaults": 0,
       "coreDumps": 0,
-      "timeouts": 24
+      "timeouts": 23
     },
     "kernelHardware": {
       "mce": [],
@@ -230,13 +230,13 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 248,
+      "tlsDays": 247,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 248
+          "days": 247
         }
       ],
       "ifErrors": [
