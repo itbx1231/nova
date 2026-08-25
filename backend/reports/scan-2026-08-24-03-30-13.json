@@ -1,20 +1,20 @@
 {
-  "ts": 1784950213989,
-  "jobId": "mrzt9j0ubhl9",
+  "ts": 1787542213778,
+  "jobId": "mt6oh2abgdwa",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
-  "overallScore": 90,
+  "overallScore": 89,
   "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 99,
+      "score": 95,
       "label": "CPU",
-      "value": "0.07 load"
+      "value": "0.38 load"
     },
     "memory": {
-      "score": 91,
+      "score": 90,
       "label": "Memory",
-      "value": "9% used"
+      "value": "10% used"
     },
     "disk": {
       "score": 100,
@@ -122,7 +122,7 @@
       "127.0.0.54:53",
       "[::]:22"
     ],
-    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  9.0G   37G  20% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
+    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  9.1G   37G  20% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
     "raidInfo": {
       "topology": "lvm",
       "arrays": [],
@@ -168,16 +168,16 @@
     "databases": {
       "postgres": {
         "installed": true,
-        "version": "16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
+        "version": "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 7,
+        "connections": 9,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
-        "totalSize": "34 MB",
+        "totalSize": "35 MB",
         "cacheHitRatio": 100,
         "maxConnections": 100,
-        "connPct": 7
+        "connPct": 9
       }
     },
     "security": {
@@ -230,17 +230,17 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 274,
+      "tlsDays": 244,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 274
+          "days": 244
         }
       ],
       "ifErrors": [
-        "ens18 rx_err=0 rx_drop=156 tx_err=0"
+        "ens18 rx_err=0 rx_drop=159 tx_err=0"
       ]
     }
   }
