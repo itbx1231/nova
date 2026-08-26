@@ -1,15 +1,15 @@
 {
-  "ts": 1787542213778,
-  "jobId": "mt6oh2abgdwa",
+  "ts": 1787628613906,
+  "jobId": "mt83wx7s4q3v",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
   "overallScore": 89,
   "health": "HEALTHY",
   "subsystems": {
     "cpu": {
-      "score": 95,
+      "score": 97,
       "label": "CPU",
-      "value": "0.38 load"
+      "value": "0.26 load"
     },
     "memory": {
       "score": 90,
@@ -170,14 +170,14 @@
         "installed": true,
         "version": "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 9,
+        "connections": 8,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
         "totalSize": "35 MB",
         "cacheHitRatio": 100,
         "maxConnections": 100,
-        "connPct": 9
+        "connPct": 8
       }
     },
     "security": {
@@ -230,13 +230,13 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 244,
+      "tlsDays": 243,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 244
+          "days": 243
         }
       ],
       "ifErrors": [
