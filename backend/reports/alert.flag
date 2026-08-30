@@ -1,0 +1,12 @@
+{
+  "ts": "2026-08-29T03:30:16.091Z",
+  "hostId": "ssh-172.12.26.127",
+  "score": 76,
+  "prevScore": 89,
+  "health": "DEGRADED",
+  "critical": 1,
+  "reasons": [
+    "score dropped 89 -> 76 (-13)",
+    "new critical findings: 0 -> 1"
+  ]
+}
