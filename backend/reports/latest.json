@@ -1,20 +1,20 @@
 {
-  "ts": 1788060616297,
-  "jobId": "mtf946skfscw",
+  "ts": 1788147034055,
+  "jobId": "mtgok1fz3sos",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
   "overallScore": 77,
   "health": "DEGRADED",
   "subsystems": {
     "cpu": {
-      "score": 98,
+      "score": 95,
       "label": "CPU",
-      "value": "0.14 load"
+      "value": "0.43 load"
     },
     "memory": {
-      "score": 90,
+      "score": 91,
       "label": "Memory",
-      "value": "10% used"
+      "value": "9% used"
     },
     "disk": {
       "score": 100,
@@ -24,7 +24,7 @@
     "network": {
       "score": 0,
       "label": "Network",
-      "value": "100% loss · DNS ok"
+      "value": "100% loss · DNS DOWN"
     },
     "services": {
       "score": 100,
@@ -58,7 +58,7 @@
     }
   },
   "rootCause": {
-    "summary": "Primary: High packet loss: 100% Pattern: No cascading failure patterns detected — subsystems are operating independently",
+    "summary": "Primary: High packet loss: 100%. Plus 1 more critical. Pattern: No cascading failure patterns detected — subsystems are operating independently",
     "confidence": 85
   },
   "correlations": [
@@ -71,6 +71,12 @@
         "area": "Network",
         "msg": "High packet loss: 100%",
         "evidence": "ping, ss -tlnp"
+      },
+      {
+        "severity": "critical",
+        "area": "Network",
+        "msg": "DNS resolution failing",
+        "evidence": "getent hosts google.com"
       }
     ],
     "warnings": [
@@ -105,16 +111,21 @@
       "priority": "MEDIUM",
       "action": "Enforce key-based SSH auth",
       "cmd": "sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl reload ssh"
+    },
+    {
+      "priority": "CRITICAL",
+      "action": "Fix DNS resolution",
+      "cmd": "systemctl restart systemd-resolved; cat /etc/resolv.conf"
     }
   ],
   "raw": {
     "kernelErrors": [],
     "recentLogs": [
-      "Jul 08 03:30:03 ubuntu sudo[266197]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
       "Jul 08 03:30:03 ubuntu sudo[266196]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
       "Jul 09 03:30:04 ubuntu sudo[645031]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
       "Jul 09 03:30:04 ubuntu sudo[645030]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
-      "Jul 09 03:30:04 ubuntu sudo[645032]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin"
+      "Jul 09 03:30:04 ubuntu sudo[645032]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
+      "Jul 09 03:30:13 ubuntu sshd[644918]: error: no more sessions"
     ],
     "failedServices": [],
     "openPorts": [
@@ -177,14 +188,14 @@
         "installed": true,
         "version": "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 8,
+        "connections": 9,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
         "totalSize": "35 MB",
         "cacheHitRatio": 100,
         "maxConnections": 100,
-        "connPct": 8
+        "connPct": 9
       }
     },
     "security": {
@@ -220,13 +231,13 @@
     "topErrors": [
       {
         "count": 1,
-        "pattern": "-- No entries --"
+        "pattern": "systemd[]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd."
       }
     ],
     "crashSignals": {
       "segfaults": 0,
       "coreDumps": 0,
-      "timeouts": 27
+      "timeouts": 28
     },
     "kernelHardware": {
       "mce": [],
@@ -234,16 +245,16 @@
     },
     "fsErrors": [],
     "network": {
-      "dnsOk": true,
+      "dnsOk": false,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 238,
+      "tlsDays": 237,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 238
+          "days": 237
         }
       ],
       "ifErrors": [
