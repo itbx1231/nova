@@ -1,15 +1,15 @@
 {
-  "ts": 1788147034055,
-  "jobId": "mtgok1fz3sos",
+  "ts": 1788233416497,
+  "jobId": "mti3zw7vii9x",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
   "overallScore": 77,
   "health": "DEGRADED",
   "subsystems": {
     "cpu": {
-      "score": 95,
+      "score": 99,
       "label": "CPU",
-      "value": "0.43 load"
+      "value": "0.06 load"
     },
     "memory": {
       "score": 91,
@@ -24,7 +24,7 @@
     "network": {
       "score": 0,
       "label": "Network",
-      "value": "100% loss · DNS DOWN"
+      "value": "100% loss · DNS ok"
     },
     "services": {
       "score": 100,
@@ -58,7 +58,7 @@
     }
   },
   "rootCause": {
-    "summary": "Primary: High packet loss: 100%. Plus 1 more critical. Pattern: No cascading failure patterns detected — subsystems are operating independently",
+    "summary": "Primary: High packet loss: 100% Pattern: No cascading failure patterns detected — subsystems are operating independently",
     "confidence": 85
   },
   "correlations": [
@@ -71,12 +71,6 @@
         "area": "Network",
         "msg": "High packet loss: 100%",
         "evidence": "ping, ss -tlnp"
-      },
-      {
-        "severity": "critical",
-        "area": "Network",
-        "msg": "DNS resolution failing",
-        "evidence": "getent hosts google.com"
       }
     ],
     "warnings": [
@@ -111,11 +105,6 @@
       "priority": "MEDIUM",
       "action": "Enforce key-based SSH auth",
       "cmd": "sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl reload ssh"
-    },
-    {
-      "priority": "CRITICAL",
-      "action": "Fix DNS resolution",
-      "cmd": "systemctl restart systemd-resolved; cat /etc/resolv.conf"
     }
   ],
   "raw": {
@@ -188,14 +177,14 @@
         "installed": true,
         "version": "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 9,
+        "connections": 8,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
         "totalSize": "35 MB",
         "cacheHitRatio": 100,
         "maxConnections": 100,
-        "connPct": 9
+        "connPct": 8
       }
     },
     "security": {
@@ -231,7 +220,7 @@
     "topErrors": [
       {
         "count": 1,
-        "pattern": "systemd[]: Failed to start fwupd-refresh.service - Refresh fwupd metadata and update motd."
+        "pattern": "-- No entries --"
       }
     ],
     "crashSignals": {
@@ -245,16 +234,16 @@
     },
     "fsErrors": [],
     "network": {
-      "dnsOk": false,
+      "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 237,
+      "tlsDays": 236,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 237
+          "days": 236
         }
       ],
       "ifErrors": [
