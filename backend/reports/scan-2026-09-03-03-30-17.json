@@ -1,20 +1,20 @@
 {
-  "ts": 1785814213869,
-  "jobId": "mse3o1f6l1z8",
+  "ts": 1788406217193,
+  "jobId": "mtkyvlhv2es5",
   "hostId": "ssh-172.12.26.127",
   "mode": "deep",
-  "overallScore": 89,
-  "health": "HEALTHY",
+  "overallScore": 76,
+  "health": "DEGRADED",
   "subsystems": {
     "cpu": {
-      "score": 91,
+      "score": 90,
       "label": "CPU",
-      "value": "0.73 load"
+      "value": "0.82 load"
     },
     "memory": {
-      "score": 91,
+      "score": 90,
       "label": "Memory",
-      "value": "9% used"
+      "value": "10% used"
     },
     "disk": {
       "score": 100,
@@ -22,9 +22,9 @@
       "value": "0 critical"
     },
     "network": {
-      "score": 100,
+      "score": 0,
       "label": "Network",
-      "value": "0% loss · DNS ok"
+      "value": "100% loss · DNS ok"
     },
     "services": {
       "score": 100,
@@ -58,14 +58,21 @@
     }
   },
   "rootCause": {
-    "summary": "No critical failures. High error count: 61. Correlation: No cascading failure patterns detected — subsystems are operating independently",
-    "confidence": 78
+    "summary": "Primary: High packet loss: 100% Pattern: No cascading failure patterns detected — subsystems are operating independently",
+    "confidence": 85
   },
   "correlations": [
     "No cascading failure patterns detected — subsystems are operating independently"
   ],
   "findings": {
-    "critical": [],
+    "critical": [
+      {
+        "severity": "critical",
+        "area": "Network",
+        "msg": "High packet loss: 100%",
+        "evidence": "ping, ss -tlnp"
+      }
+    ],
     "warnings": [
       {
         "severity": "warning",
@@ -103,11 +110,11 @@
   "raw": {
     "kernelErrors": [],
     "recentLogs": [
-      "Jul 08 03:30:03 ubuntu sudo[266197]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
       "Jul 08 03:30:03 ubuntu sudo[266196]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
       "Jul 09 03:30:04 ubuntu sudo[645031]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/vgs --noheadings -o vg_name,pv_count,lv_count,vg_size,vg_free",
       "Jul 09 03:30:04 ubuntu sudo[645030]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/pvs --noheadings -o pv_name,pv_size,vg_name,pv_pe_count",
-      "Jul 09 03:30:04 ubuntu sudo[645032]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin"
+      "Jul 09 03:30:04 ubuntu sudo[645032]:   ubuntu : a password is required ; PWD=/home/ubuntu ; USER=root ; COMMAND=/usr/sbin/lvs --noheadings -o lv_name,vg_name,lv_size,lv_attr,origin",
+      "Jul 09 03:30:13 ubuntu sshd[644918]: error: no more sessions"
     ],
     "failedServices": [],
     "openPorts": [
@@ -122,7 +129,7 @@
       "127.0.0.54:53",
       "[::]:22"
     ],
-    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  9.0G   37G  20% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
+    "diskStatus": "Filesystem                         Size  Used Avail Use% Mounted on\ntmpfs                              1.1G  1.1M  1.0G   1% /run\n/dev/mapper/ubuntu--vg-ubuntu--lv   48G  9.1G   37G  21% /\ntmpfs                              5.1G  1.1M  5.1G   1% /dev/shm\ntmpfs                              5.0M     0  5.0M   0% /run/lock\n/dev/sda2                          2.0G  200M  1.6G  11% /boot\ntmpfs                              1.1G   12K  1.1G   1% /run/user/1000",
     "raidInfo": {
       "topology": "lvm",
       "arrays": [],
@@ -168,16 +175,16 @@
     "databases": {
       "postgres": {
         "installed": true,
-        "version": "16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
+        "version": "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
         "status": "active",
-        "connections": 7,
+        "connections": 9,
         "slowQueries": 0,
         "waitingLocks": 0,
         "replicas": 0,
-        "totalSize": "34 MB",
+        "totalSize": "35 MB",
         "cacheHitRatio": 100,
         "maxConnections": 100,
-        "connPct": 7
+        "connPct": 9
       }
     },
     "security": {
@@ -219,7 +226,7 @@
     "crashSignals": {
       "segfaults": 0,
       "coreDumps": 0,
-      "timeouts": 25
+      "timeouts": 28
     },
     "kernelHardware": {
       "mce": [],
@@ -230,17 +237,17 @@
       "dnsOk": true,
       "gateway": "172.12.26.1",
       "gatewayReachable": true,
-      "tlsDays": 264,
+      "tlsDays": 234,
       "tlsExpiry": "Apr 25 15:22:24 2027 GMT",
       "tlsCerts": [
         {
           "port": 443,
           "expiry": "Apr 25 15:22:24 2027 GMT",
-          "days": 264
+          "days": 234
         }
       ],
       "ifErrors": [
-        "ens18 rx_err=0 rx_drop=156 tx_err=0"
+        "ens18 rx_err=0 rx_drop=159 tx_err=0"
       ]
     }
   }
